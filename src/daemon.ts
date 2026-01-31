@@ -6,7 +6,7 @@
  * Protocol: NDJSON over Unix socket
  */
 
-import { existsSync, mkdirSync, unlinkSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, unlinkSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
 import type { Database } from "bun:sqlite";
 import type { TCPSocketListener } from "bun";
 import {
@@ -76,9 +76,11 @@ const stores = new Map<string, ReturnType<typeof createStore>>();
 let server: TCPSocketListener<DaemonSocketData> | null = null;
 let startTime: number = 0;
 let activeConnections = 0;
+let activeRequests = 0;
 let shuttingDown = false;
 let signalHandlersRegistered = false;
 const TRACE = Bun.env.QMD_DAEMON_TRACE === "1";
+const activeSockets = new Set<{ end: () => void; data: DaemonSocketData }>();
 
 // Track which models have been loaded
 const loadedModels = new Set<string>();
@@ -88,6 +90,20 @@ enableProductionMode();
 
 const DEFAULT_SEARCH_LIMIT = 20;
 const DEFAULT_QUERY_LIMIT = 5;
+const MAX_SEARCH_LIMIT = 100;
+const MAX_QUERY_LIMIT = 50;
+const MAX_GET_MAX_LINES = 5000;
+const MAX_MULTI_GET_MAX_LINES = 2000;
+const MAX_MULTI_GET_MAX_BYTES = 256 * 1024; // 256KB
+const MAX_MULTI_GET_TOTAL_BYTES = 1024 * 1024; // 1MB
+const MAX_GET_BODY_BYTES = 1024 * 1024; // 1MB
+const MAX_STORE_CACHE = 4;
+const MAX_MULTI_GET_FILES = 200;
+const SHUTDOWN_TIMEOUT_MS = 5000;
+const CLIENT_RESPONSE_BUFFER_LIMIT = 1024 * 1024 * 2; // 2MB
+const CACHE_DIR_MODE = 0o700;
+const SOCKET_FILE_MODE = 0o600;
+const PID_FILE_MODE = 0o600;
 const VSEARCH_PER_QUERY_LIMIT = 20;
 const VSEARCH_ALL_PER_QUERY_LIMIT = 500;
 const QUERY_FTS_LIMIT = 20;
@@ -118,24 +134,108 @@ type LineFramer = {
 type DaemonSocketData = {
   framer: LineFramer;
   cleaned?: boolean; // Track if connection was already cleaned up
+  pending?: Promise<void>;
 };
+
+class UserError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UserError";
+  }
+}
+
+function withUmask<T>(mask: number, fn: () => T): T {
+  const previous = process.umask(mask);
+  try {
+    return fn();
+  } finally {
+    process.umask(previous);
+  }
+}
+
+function normalizeForCompare(path: string): string {
+  return path.replace(/\\/g, "/");
+}
+
+function sanitizeForLog(text: string, maxLength: number): string {
+  const sanitized = text.replace(/[\u0000-\u001f\u007f-\u009f]/g, "?");
+  return sanitized.length > maxLength ? sanitized.slice(0, maxLength) : sanitized;
+}
+
+function userError(message: string): UserError {
+  return new UserError(message);
+}
+
+function getAllowedDbRoots(): string[] {
+  const roots = new Set<string>();
+  roots.add(normalizeForCompare(getRealPath(CACHE_DIR)));
+  const defaultDbPath = getDefaultDbPath();
+  roots.add(normalizeForCompare(resolve(defaultDbPath, "..")));
+  const extraRoots = Bun.env.QMD_DAEMON_DB_ROOTS;
+  if (extraRoots) {
+    const parts = extraRoots.split(":").map((p) => p.trim()).filter(Boolean);
+    for (const part of parts) {
+      roots.add(normalizeForCompare(getRealPath(resolve(part))));
+    }
+  }
+  return Array.from(roots);
+}
+
+function normalizeDbPath(dbPath: string): string {
+  return normalizeForCompare(getRealPath(resolve(dbPath)));
+}
+
+function isDbPathAllowed(dbPath: string): boolean {
+  const normalizedPath = normalizeDbPath(dbPath);
+  const roots = getAllowedDbRoots();
+  return roots.some((root) => {
+    const normalizedRoot = normalizeForCompare(root);
+    const prefix = normalizedRoot.endsWith("/") ? normalizedRoot : `${normalizedRoot}/`;
+    return normalizedPath === normalizedRoot || normalizedPath.startsWith(prefix);
+  });
+}
+
+function ensureAllowedDbPath(dbPath: string): string {
+  const normalized = normalizeDbPath(dbPath);
+  if (!isDbPathAllowed(normalized)) {
+    throw userError("Invalid dbPath: access is restricted to the daemon cache directory.");
+  }
+  return normalized;
+}
+
+function formatErrorMessage(err: unknown, maxLength: number): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return sanitizeForLog(message, maxLength);
+}
 
 function registerSignalHandlers(): void {
   if (signalHandlersRegistered) return;
   signalHandlersRegistered = true;
 
-  process.on("SIGTERM", () => stopServer());
-  process.on("SIGINT", () => stopServer());
+  process.on("SIGTERM", () => {
+    void stopServer().catch((err) => {
+      console.error("Shutdown failed:", formatErrorMessage(err, 200));
+    });
+  });
+  process.on("SIGINT", () => {
+    void stopServer().catch((err) => {
+      console.error("Shutdown failed:", formatErrorMessage(err, 200));
+    });
+  });
 
   // Global error handlers to catch unhandled errors
   process.on("unhandledRejection", (reason) => {
-    console.error("[FATAL] Unhandled promise rejection:", reason);
-    stopServer();
+    console.error("[FATAL] Unhandled promise rejection:", formatErrorMessage(reason, 200));
+    void stopServer().catch((err) => {
+      console.error("Shutdown failed:", formatErrorMessage(err, 200));
+    });
   });
 
   process.on("uncaughtException", (err) => {
-    console.error("[FATAL] Uncaught exception:", err);
-    stopServer();
+    console.error("[FATAL] Uncaught exception:", formatErrorMessage(err, 200));
+    void stopServer().catch((error) => {
+      console.error("Shutdown failed:", formatErrorMessage(error, 200));
+    });
   });
 }
 
@@ -144,13 +244,19 @@ function registerSignalHandlers(): void {
 // =============================================================================
 
 function resolveDbPath(dbPath?: string): string {
-  return dbPath || getDefaultDbPath();
+  const resolved = dbPath ?? getDefaultDbPath();
+  return ensureAllowedDbPath(resolved);
 }
 
 function getStore(dbPath?: string): ReturnType<typeof createStore> {
   const resolved = resolveDbPath(dbPath);
   const existing = stores.get(resolved);
   if (existing) return existing;
+  if (stores.size >= MAX_STORE_CACHE) {
+    throw userError(
+      `Too many open dbPath values. Limit is ${MAX_STORE_CACHE}. Use the default index or restart the daemon.`
+    );
+  }
   const created = createStore(resolved);
   stores.set(resolved, created);
   return created;
@@ -185,16 +291,13 @@ type LogBuffer = {
   };
 };
 
-function truncateLine(text: string, maxLength: number): string {
-  return text.length > maxLength ? text.slice(0, maxLength) : text;
-}
-
 function formatLineSnippet(line: string): string {
-  return truncateLine(line, ERROR_SNIPPET_LIMIT);
+  return sanitizeForLog(line, ERROR_SNIPPET_LIMIT);
 }
 
 function formatParseError(prefix: string, message: string, line: string): string {
-  return `${prefix}: ${message}. Line starts with: ${formatLineSnippet(line)}`;
+  const safeMessage = sanitizeForLog(message, ERROR_SNIPPET_LIMIT);
+  return `${prefix}: ${safeMessage}. Line starts with: ${formatLineSnippet(line)}`;
 }
 
 function createErrorWithCause(message: string, cause: unknown): Error {
@@ -344,13 +447,13 @@ function describeValue(value: unknown): string {
 
 function requireNonEmptyString(value: unknown, name: string, hint: string): string {
   if (value === undefined || value === null) {
-    throw new Error(`Missing required argument: ${name}. ${hint}`);
+    throw userError(`Missing required argument: ${name}. ${hint}`);
   }
   if (typeof value !== "string") {
-    throw new Error(`Invalid argument: ${name} must be a non-empty string (received ${describeValue(value)}). ${hint}`);
+    throw userError(`Invalid argument: ${name} must be a non-empty string (received ${describeValue(value)}). ${hint}`);
   }
   if (!value.trim()) {
-    throw new Error(`Missing required argument: ${name}. ${hint}`);
+    throw userError(`Missing required argument: ${name}. ${hint}`);
   }
   return value;
 }
@@ -358,10 +461,10 @@ function requireNonEmptyString(value: unknown, name: string, hint: string): stri
 function optionalNonEmptyString(value: unknown, name: string): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "string") {
-    throw new Error(`Invalid argument: ${name} must be a non-empty string (received ${describeValue(value)}).`);
+    throw userError(`Invalid argument: ${name} must be a non-empty string (received ${describeValue(value)}).`);
   }
   if (!value.trim()) {
-    throw new Error(`Invalid argument: ${name} must be a non-empty string (received ${describeValue(value)}).`);
+    throw userError(`Invalid argument: ${name} must be a non-empty string (received ${describeValue(value)}).`);
   }
   return value;
 }
@@ -369,7 +472,7 @@ function optionalNonEmptyString(value: unknown, name: string): string | undefine
 function optionalBoolean(value: unknown, name: string): boolean | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "boolean") {
-    throw new Error(`Invalid argument: ${name} must be a boolean (received ${describeValue(value)}).`);
+    throw userError(`Invalid argument: ${name} must be a boolean (received ${describeValue(value)}).`);
   }
   return value;
 }
@@ -381,18 +484,24 @@ function optionalNumber(
 ): number | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new Error(`Invalid argument: ${name} must be a finite number (received ${describeValue(value)}).`);
+    throw userError(`Invalid argument: ${name} must be a finite number (received ${describeValue(value)}).`);
   }
   if (opts.integer && !Number.isInteger(value)) {
-    throw new Error(`Invalid argument: ${name} must be an integer (received ${describeValue(value)}).`);
+    throw userError(`Invalid argument: ${name} must be an integer (received ${describeValue(value)}).`);
   }
   if (opts.min !== undefined && value < opts.min) {
-    throw new Error(`Invalid argument: ${name} must be >= ${opts.min} (received ${describeValue(value)}).`);
+    throw userError(`Invalid argument: ${name} must be >= ${opts.min} (received ${describeValue(value)}).`);
   }
   if (opts.max !== undefined && value > opts.max) {
-    throw new Error(`Invalid argument: ${name} must be <= ${opts.max} (received ${describeValue(value)}).`);
+    throw userError(`Invalid argument: ${name} must be <= ${opts.max} (received ${describeValue(value)}).`);
   }
   return value;
+}
+
+function validateDbPath(value: unknown): string | undefined {
+  const raw = optionalNonEmptyString(value, "dbPath");
+  if (!raw) return undefined;
+  return ensureAllowedDbPath(raw);
 }
 
 /**
@@ -403,12 +512,12 @@ export function validateSearchArgs(args: unknown): SearchArgs {
   const query = requireNonEmptyString(a.query, "query", "Provide a non-empty search string.");
   return {
     query: query.trim(),
-    limit: optionalNumber(a.limit, "limit", { min: 1, integer: true }),
+    limit: optionalNumber(a.limit, "limit", { min: 1, max: MAX_SEARCH_LIMIT, integer: true }),
     minScore: optionalNumber(a.minScore, "minScore", { min: 0, max: 1 }),
     all: optionalBoolean(a.all, "all"),
     collection: optionalNonEmptyString(a.collection, "collection"),
     full: optionalBoolean(a.full, "full"),
-    dbPath: optionalNonEmptyString(a.dbPath, "dbPath"),
+    dbPath: validateDbPath(a.dbPath),
     useColor: optionalBoolean(a.useColor, "useColor"),
     context: optionalNonEmptyString(a.context, "context"),
   };
@@ -423,8 +532,8 @@ export function validateGetArgs(args: unknown): GetArgs {
   return {
     path,
     fromLine: optionalNumber(a.fromLine, "fromLine", { min: 1, integer: true }),
-    maxLines: optionalNumber(a.maxLines, "maxLines", { min: 1, integer: true }),
-    dbPath: optionalNonEmptyString(a.dbPath, "dbPath"),
+    maxLines: optionalNumber(a.maxLines, "maxLines", { min: 1, max: MAX_GET_MAX_LINES, integer: true }),
+    dbPath: validateDbPath(a.dbPath),
     cwd: optionalNonEmptyString(a.cwd, "cwd"),
   };
 }
@@ -441,9 +550,9 @@ export function validateMultiGetArgs(args: unknown): MultiGetArgs {
   );
   return {
     pattern,
-    maxLines: optionalNumber(a.maxLines, "maxLines", { min: 1, integer: true }),
-    maxBytes: optionalNumber(a.maxBytes, "maxBytes", { min: 1, integer: true }),
-    dbPath: optionalNonEmptyString(a.dbPath, "dbPath"),
+    maxLines: optionalNumber(a.maxLines, "maxLines", { min: 1, max: MAX_MULTI_GET_MAX_LINES, integer: true }),
+    maxBytes: optionalNumber(a.maxBytes, "maxBytes", { min: 1, max: MAX_MULTI_GET_MAX_BYTES, integer: true }),
+    dbPath: validateDbPath(a.dbPath),
   };
 }
 
@@ -454,7 +563,7 @@ export function validateLsArgs(args: unknown): LsArgs {
   const a = (args && typeof args === "object") ? (args as Record<string, unknown>) : {};
   return {
     path: optionalNonEmptyString(a.path, "path"),
-    dbPath: optionalNonEmptyString(a.dbPath, "dbPath"),
+    dbPath: validateDbPath(a.dbPath),
   };
 }
 
@@ -464,13 +573,13 @@ export function validateLsArgs(args: unknown): LsArgs {
 export function validateStatusArgs(args: unknown): { dbPath?: string } {
   const a = (args && typeof args === "object") ? (args as Record<string, unknown>) : {};
   return {
-    dbPath: optionalNonEmptyString(a.dbPath, "dbPath"),
+    dbPath: validateDbPath(a.dbPath),
   };
 }
 
 function requireEmptyArgs(args: Record<string, unknown>, cmd: string): void {
   if (Object.keys(args).length > 0) {
-    throw new Error(`Invalid argument: ${cmd} does not accept any arguments.`);
+    throw userError(`Invalid argument: ${cmd} does not accept any arguments.`);
   }
 }
 
@@ -478,7 +587,7 @@ function resolveCollectionName(collection?: string): string | undefined {
   if (!collection) return undefined;
   const coll = getCollectionFromYaml(collection);
   if (!coll) {
-    throw new Error(`Collection not found: ${collection}. Run 'qmd collection list' to see available collections.`);
+    throw userError(`Collection not found: ${collection}. Run 'qmd collection list' to see available collections.`);
   }
   return collection;
 }
@@ -724,7 +833,7 @@ function resolveDocidPath(db: Database, inputPath: string, originalPath: string)
   if (!isDocid(inputPath)) return inputPath;
   const docidMatch = findDocumentByDocid(db, inputPath);
   if (!docidMatch) {
-    throw new Error(`Document not found: ${originalPath}. Try a qmd:// path, a docid (prefix #), or 'qmd ls <collection>'.`);
+    throw userError(`Document not found: ${originalPath}. Try a qmd:// path, a docid (prefix #), or 'qmd ls <collection>'.`);
   }
   return docidMatch.filepath;
 }
@@ -743,13 +852,13 @@ function parseCollectionPath(inputPath: string): { collectionName: string; path:
 function parseLsPath(inputPath: string): { collectionName: string; pathPrefix: string | null } {
   if (inputPath.startsWith("qmd://")) {
     const parsed = parseVirtualPath(inputPath);
-    if (!parsed) {
-      throw new Error(`Invalid virtual path: ${inputPath}. Expected format: qmd://<collection>/<path>.`);
-    }
-    return {
-      collectionName: parsed.collectionName,
-      pathPrefix: parsed.path || null,
-    };
+  if (!parsed) {
+    throw userError(`Invalid virtual path: ${inputPath}. Expected format: qmd://<collection>/<path>.`);
+  }
+  return {
+    collectionName: parsed.collectionName,
+    pathPrefix: parsed.path || null,
+  };
   }
 
   const parts = inputPath.split("/");
@@ -764,7 +873,7 @@ function resolveDocFromVirtualPath(db: Database, inputPath: string): ResolvedDoc
   if (!isVirtualPath(inputPath)) return null;
   const parsed = parseVirtualPath(inputPath);
   if (!parsed) {
-    throw new Error(`Invalid virtual path: ${inputPath}. Expected format: qmd://<collection>/<path>.`);
+    throw userError(`Invalid virtual path: ${inputPath}. Expected format: qmd://<collection>/<path>.`);
   }
   const doc = getDocByCollectionPath(db, parsed.collectionName, parsed.path);
   if (!doc) return null;
@@ -826,6 +935,13 @@ function truncateBodyByLines(body: string, maxLines: number): string {
   return `${truncated}\n\n[... truncated ${lines.length - maxLines} more lines]`;
 }
 
+function truncateBodyByBytes(body: string, maxBytes: number): string {
+  const bytes = Buffer.byteLength(body, "utf8");
+  if (bytes <= maxBytes) return body;
+  const truncated = Buffer.from(body, "utf8").subarray(0, maxBytes).toString("utf8");
+  return `${truncated}\n\n[... truncated ${bytes - maxBytes} bytes]`;
+}
+
 function parseMultiGetPattern(pattern: string): { kind: "list"; items: string[] } | { kind: "glob" } {
   const isList = pattern.includes(",") && !pattern.includes("*") && !pattern.includes("?");
   if (!isList) return { kind: "glob" };
@@ -852,7 +968,10 @@ function resolveMultiGetTargets(db: Database, patternText: string): { files: Mul
 
   if (pattern.kind === "list") {
     if (pattern.items.length === 0) {
-      throw new Error("No files specified in pattern list. Provide a comma-separated list or a glob pattern.");
+      throw userError("No files specified in pattern list. Provide a comma-separated list or a glob pattern.");
+    }
+    if (pattern.items.length > MAX_MULTI_GET_FILES) {
+      throw userError(`Too many files in list (max ${MAX_MULTI_GET_FILES}). Split your request.`);
     }
 
     const files: MultiGetTarget[] = [];
@@ -893,7 +1012,10 @@ function resolveMultiGetTargets(db: Database, patternText: string): { files: Mul
   }));
 
   if (files.length === 0) {
-    throw new Error(`No files matched pattern: ${patternText}. Try 'qmd ls <collection>' to browse files.`);
+    throw userError(`No files matched pattern: ${patternText}. Try 'qmd ls <collection>' to browse files.`);
+  }
+  if (files.length > MAX_MULTI_GET_FILES) {
+    throw userError(`Too many files matched pattern (max ${MAX_MULTI_GET_FILES}). Narrow the pattern or use a list.`);
   }
 
   return { files, errors };
@@ -1155,7 +1277,7 @@ async function runHybridQueryPipeline(
  * Handle a search command
  */
 async function handleSearch(args: SearchArgs): Promise<DaemonSearchResponse> {
-  const limit = args.limit ?? DEFAULT_SEARCH_LIMIT;
+  const limit = Math.min(args.limit ?? DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT);
   const collectionName = resolveCollectionName(args.collection);
   const db = getDb(args.dbPath);
   const results = searchFTS(db, args.query, limit, collectionName);
@@ -1168,13 +1290,13 @@ async function handleSearch(args: SearchArgs): Promise<DaemonSearchResponse> {
  * Handle a vector search command
  */
 async function handleVsearch(args: SearchArgs): Promise<DaemonSearchResponse> {
-  const limit = args.limit ?? DEFAULT_SEARCH_LIMIT;
+  const limit = Math.min(args.limit ?? DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT);
   const logger = createLogBuffer(args.useColor);
   const collectionName = resolveCollectionName(args.collection);
 
   const db = getDb(args.dbPath);
   if (!hasVectorIndex(db)) {
-    throw new Error("Vector index not found. Run 'qmd embed' to create embeddings before using vector search.");
+    throw userError("Vector index not found. Run 'qmd embed' to create embeddings before using vector search.");
   }
 
   checkIndexHealthWithLogs(db, logger);
@@ -1215,7 +1337,7 @@ async function handleVsearch(args: SearchArgs): Promise<DaemonSearchResponse> {
  * Handle a hybrid query command (search + vsearch + rerank)
  */
 async function handleQuery(args: SearchArgs): Promise<DaemonSearchResponse> {
-  const limit = args.limit ?? DEFAULT_QUERY_LIMIT;
+  const limit = Math.min(args.limit ?? DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT);
   const logger = createLogBuffer(args.useColor);
   const collectionName = resolveCollectionName(args.collection);
 
@@ -1245,13 +1367,14 @@ async function handleGet(args: GetArgs): Promise<DaemonGetResponse> {
 
   const resolved = resolveDocFromInputPath(db, inputPath, args.cwd);
   if (!resolved) {
-    throw new Error(`Document not found: ${originalPath}. Try a qmd:// path, a docid (prefix #), or 'qmd ls <collection>'.`);
+    throw userError(`Document not found: ${originalPath}. Try a qmd:// path, a docid (prefix #), or 'qmd ls <collection>'.`);
   }
 
   const { doc, virtualPath } = resolved;
   const context = getContextForPath(db, doc.collectionName, doc.path);
   const startLine = parsed.fromLine ?? 1;
-  const body = sliceDocumentBody(doc.body, startLine, args.maxLines);
+  const sliced = sliceDocumentBody(doc.body, startLine, args.maxLines);
+  const body = truncateBodyByBytes(sliced, MAX_GET_BODY_BYTES);
 
   return {
     file: virtualPath,
@@ -1269,10 +1392,11 @@ async function handleGet(args: GetArgs): Promise<DaemonGetResponse> {
  */
 async function handleMultiGet(args: MultiGetArgs): Promise<DaemonMultiGetResponse> {
   const db = getDb(args.dbPath);
-  const maxBytes = args.maxBytes ?? DEFAULT_MULTI_GET_MAX_BYTES;
+  const maxBytes = Math.min(args.maxBytes ?? DEFAULT_MULTI_GET_MAX_BYTES, MAX_MULTI_GET_MAX_BYTES);
   const { files, errors } = resolveMultiGetTargets(db, args.pattern);
 
   const results: DaemonMultiGetResponse["results"] = [];
+  let totalBytes = 0;
 
   for (const file of files) {
     const location = resolveMultiGetLocation(file);
@@ -1295,7 +1419,13 @@ async function handleMultiGet(args: MultiGetArgs): Promise<DaemonMultiGetRespons
     const doc = getDocBody(db, location.collection, location.path);
     if (!doc) continue;
 
-    const body = args.maxLines !== undefined ? truncateBodyByLines(doc.body, args.maxLines) : doc.body;
+    const bodyByLines = args.maxLines !== undefined ? truncateBodyByLines(doc.body, args.maxLines) : doc.body;
+    const body = truncateBodyByBytes(bodyByLines, maxBytes);
+    const bodyBytes = Buffer.byteLength(body, "utf8");
+    if (totalBytes + bodyBytes > MAX_MULTI_GET_TOTAL_BYTES) {
+      errors.push(`Response too large. Stopped after ${results.length} files (limit ${Math.round(MAX_MULTI_GET_TOTAL_BYTES / 1024)}KB).`);
+      break;
+    }
 
     results.push({
       file: file.filepath,
@@ -1305,6 +1435,7 @@ async function handleMultiGet(args: MultiGetArgs): Promise<DaemonMultiGetRespons
       context,
       skipped: false,
     });
+    totalBytes += bodyBytes;
   }
 
   return { results, errors };
@@ -1454,7 +1585,7 @@ async function handleCommand(req: DaemonRequestGeneric): Promise<DaemonResponse>
         result = { pong: true, pid: process.pid } satisfies DaemonPingResponse;
         break;
       default:
-        throw new Error(`Unknown command: ${req.cmd}. Expected one of: ${Array.from(DAEMON_COMMANDS).join(", ")}.`);
+        throw userError(`Unknown command: ${req.cmd}. Expected one of: ${Array.from(DAEMON_COMMANDS).join(", ")}.`);
     }
 
     if (TRACE) {
@@ -1463,18 +1594,21 @@ async function handleCommand(req: DaemonRequestGeneric): Promise<DaemonResponse>
     }
     return { ok: true, result };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    const stack = err instanceof Error ? err.stack : undefined;
-    // Log server-side for debugging with request context
-    const argsSummary = JSON.stringify(req.args).slice(0, 200);
-    console.error(`Command '${req.cmd}' failed: ${message}`);
-    console.error(`  args: ${argsSummary}`);
-    if (stack) console.error(stack);
+    const userFacing = err instanceof UserError;
+    const message = formatErrorMessage(err, 200);
+    if (userFacing) {
+      console.error(`Command '${req.cmd}' rejected: ${message}`);
+    } else {
+      console.error(`Command '${req.cmd}' failed.`);
+      if (TRACE && err instanceof Error && err.stack) {
+        console.error(err.stack);
+      }
+    }
     if (TRACE) {
       const elapsed = Date.now() - startedAt;
       console.log(`[daemon] ${req.cmd} error (${elapsed}ms)`);
     }
-    return { ok: false, error: message };
+    return { ok: false, error: userFacing ? message : "Internal error. Try again or check daemon logs." };
   }
 }
 
@@ -1488,6 +1622,7 @@ function createLineFramer(maxBytes: number): LineFramer {
     push(chunk: string) {
       buffer += chunk;
       if (buffer.length > maxBytes) {
+        buffer = "";
         return { lines: [], overflow: true };
       }
       const lines = buffer.split('\n');
@@ -1503,63 +1638,92 @@ function createLineFramer(maxBytes: number): LineFramer {
 async function handleRequestLine(socket: { write: (text: string) => void }, line: string): Promise<void> {
   if (!line.trim()) return;
 
-  try {
-    const parsed = JSON.parse(line) as unknown;
-    if (!isDaemonRequestGeneric(parsed)) {
-      throw new Error("Invalid request: expected { cmd, args } with a supported command.");
-    }
-    const res = await handleCommand(parsed);
+  if (shuttingDown) {
+    const res: DaemonResponse = { ok: false, error: "Daemon is shutting down. Try again shortly." };
     socket.write(JSON.stringify(res) + '\n');
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line) as unknown;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const res: DaemonResponse = { ok: false, error: formatParseError("Parse error", message, line) };
     socket.write(JSON.stringify(res) + '\n');
+    return;
+  }
+
+  if (!isDaemonRequestGeneric(parsed)) {
+    const res: DaemonResponse = { ok: false, error: "Invalid request: expected { cmd, args } with a supported command." };
+    socket.write(JSON.stringify(res) + '\n');
+    return;
+  }
+
+  activeRequests++;
+  try {
+    const res = await handleCommand(parsed);
+    socket.write(JSON.stringify(res) + '\n');
+  } finally {
+    activeRequests--;
   }
 }
 
 function startServer(): void {
   registerSignalHandlers();
 
-  // Ensure cache directory exists
-  if (!existsSync(CACHE_DIR)) {
-    mkdirSync(CACHE_DIR, { recursive: true });
+  if (isDaemonRunning()) {
+    console.error("Daemon already running (socket and PID file present).");
+    process.exit(1);
   }
 
-  // Remove stale socket if it exists
-  if (existsSync(SOCKET_PATH)) {
-    try {
-      unlinkSync(SOCKET_PATH);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`Warning: Could not remove stale socket ${SOCKET_PATH}: ${msg}`);
-      console.error("You may need to manually delete it or check file permissions.");
-    }
+  cleanupStaleFiles();
+
+  // Ensure cache directory exists
+  if (!existsSync(CACHE_DIR)) {
+    mkdirSync(CACHE_DIR, { recursive: true, mode: CACHE_DIR_MODE });
+  }
+  try {
+    chmodSync(CACHE_DIR, CACHE_DIR_MODE);
+  } catch {
+    // best effort
   }
 
   startTime = Date.now();
 
-  server = Bun.listen<DaemonSocketData>({
+  server = withUmask(0o077, () => Bun.listen<DaemonSocketData>({
     unix: SOCKET_PATH,
     socket: {
       open(socket) {
-        socket.data = { framer: createLineFramer(SOCKET_BUFFER_LIMIT) };
+        socket.data = { framer: createLineFramer(SOCKET_BUFFER_LIMIT), pending: Promise.resolve() };
         activeConnections++;
+        activeSockets.add(socket);
       },
 
       async data(socket, data) {
-        const { lines, overflow } = socket.data.framer.push(data.toString());
-        if (overflow) {
-          const res: DaemonResponse = {
-            ok: false,
-            error: `Request too large (>${SOCKET_BUFFER_LIMIT} bytes).`,
-          };
-          socket.write(JSON.stringify(res) + '\n');
-          socket.end();
-          return;
-        }
+        const enqueue = async () => {
+          const { lines, overflow } = socket.data.framer.push(data.toString());
+          if (overflow) {
+            const res: DaemonResponse = {
+              ok: false,
+              error: `Request too large (>${SOCKET_BUFFER_LIMIT} bytes).`,
+            };
+            socket.write(JSON.stringify(res) + '\n');
+            socket.end();
+            return;
+          }
 
-        for (const line of lines) {
-          await handleRequestLine(socket, line);
+          for (const line of lines) {
+            await handleRequestLine(socket, line);
+          }
+        };
+
+        socket.data.pending = (socket.data.pending ?? Promise.resolve()).then(enqueue, enqueue);
+        try {
+          await socket.data.pending;
+        } catch (err) {
+          console.error("Socket handler error:", formatErrorMessage(err, 200));
+          socket.end();
         }
       },
 
@@ -1568,26 +1732,50 @@ function startServer(): void {
           socket.data.cleaned = true;
           activeConnections--;
         }
+        activeSockets.delete(socket);
       },
 
       error(socket, error) {
         const bufferInfo = socket.data?.framer.getBuffer()
-          ? ` (partial: ${socket.data.framer.getBuffer().slice(0, SOCKET_ERROR_PARTIAL_LIMIT)}...)`
+          ? ` (partial: ${formatLineSnippet(socket.data.framer.getBuffer().slice(0, SOCKET_ERROR_PARTIAL_LIMIT))}...)`
           : '';
-        console.error(`Socket error${bufferInfo}:`, error);
+        console.error(`Socket error${bufferInfo}:`, formatErrorMessage(error, 200));
         if (socket.data && !socket.data.cleaned) {
           socket.data.cleaned = true;
           activeConnections--;
         }
+        activeSockets.delete(socket);
       },
     },
-  });
+  }));
+
+  try {
+    chmodSync(SOCKET_PATH, SOCKET_FILE_MODE);
+  } catch {
+    // best effort
+  }
 
   // Write PID file
-  writeFileSync(PID_PATH, String(process.pid));
+  withUmask(0o077, () => {
+    writeFileSync(PID_PATH, String(process.pid), { mode: PID_FILE_MODE });
+  });
+  try {
+    chmodSync(PID_PATH, PID_FILE_MODE);
+  } catch {
+    // best effort
+  }
 
   console.log(`QMD daemon started (PID ${process.pid})`);
   console.log(`Socket: ${SOCKET_PATH}`);
+}
+
+async function waitForDrain(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (activeConnections === 0 && activeRequests === 0) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
 }
 
 async function stopServer(): Promise<void> {
@@ -1601,6 +1789,20 @@ async function stopServer(): Promise<void> {
   if (server) {
     server.stop();
     server = null;
+  }
+
+  for (const socket of activeSockets) {
+    try {
+      socket.end();
+    } catch {
+      // ignore
+    }
+  }
+
+  const drained = await waitForDrain(SHUTDOWN_TIMEOUT_MS);
+  if (!drained) {
+    console.error(`Warning: Timed out waiting for ${activeConnections} connection(s) and ${activeRequests} request(s).`);
+    cleanupErrors++;
   }
 
   // Clean up socket file
@@ -1665,7 +1867,7 @@ export function runDaemonForeground(): void {
  */
 export async function sendToDaemon(req: DaemonRequest, timeoutMs = 30000): Promise<DaemonResponse> {
   if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-    throw new Error(`Invalid timeoutMs: expected a positive number of milliseconds (received ${describeValue(timeoutMs)}).`);
+    throw userError(`Invalid timeoutMs: expected a positive number of milliseconds (received ${describeValue(timeoutMs)}).`);
   }
   return new Promise((resolve, reject) => {
     let buffer = "";
@@ -1708,6 +1910,11 @@ export async function sendToDaemon(req: DaemonRequest, timeoutMs = 30000): Promi
 
           // Buffer data until we get a complete line
           buffer += data.toString();
+          if (buffer.length > CLIENT_RESPONSE_BUFFER_LIMIT) {
+            finalize(true);
+            reject(new Error(`Daemon response exceeded ${CLIENT_RESPONSE_BUFFER_LIMIT} bytes.`));
+            return;
+          }
           const newlineIdx = buffer.indexOf('\n');
           if (newlineIdx === -1) return; // Wait for more data
 

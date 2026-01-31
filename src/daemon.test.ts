@@ -3,12 +3,14 @@
  */
 
 import { describe, test, expect } from "bun:test";
+import { join } from "node:path";
 
 // Import protocol types and utilities
 import {
   DAEMON_COMMANDS,
   NON_DAEMON_COMMANDS,
   shouldUseDaemon,
+  CACHE_DIR,
   type DaemonRequest,
   type DaemonResponse,
 } from "./protocol";
@@ -188,10 +190,11 @@ describe("Daemon: Input validation", () => {
 
   test("validateSearchArgs preserves context and useColor", async () => {
     const { validateSearchArgs } = await import("./daemon");
-    const result = validateSearchArgs({ query: "test", context: "ctx", useColor: true, dbPath: "/tmp/db" });
+    const dbPath = join(CACHE_DIR, "test.sqlite");
+    const result = validateSearchArgs({ query: "test", context: "ctx", useColor: true, dbPath });
     expect(result.context).toBe("ctx");
     expect(result.useColor).toBe(true);
-    expect(result.dbPath).toBe("/tmp/db");
+    expect(result.dbPath).toBe(dbPath);
   });
 
   test("validateGetArgs throws on missing path", async () => {
