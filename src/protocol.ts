@@ -95,17 +95,106 @@ export type DaemonCommandName = DaemonRequest["cmd"];
  * Generic request type for dynamic command dispatch
  * Use DaemonRequest for type-safe construction, this for parsing
  */
-export type DaemonRequestGeneric = {
-  cmd: string;
-  args: Record<string, unknown>;
+export type DaemonRequestGeneric =
+  | { cmd: "search"; args: Record<string, unknown> }
+  | { cmd: "vsearch"; args: Record<string, unknown> }
+  | { cmd: "query"; args: Record<string, unknown> }
+  | { cmd: "get"; args: Record<string, unknown> }
+  | { cmd: "multi-get"; args: Record<string, unknown> }
+  | { cmd: "ls"; args: Record<string, unknown> }
+  | { cmd: "status"; args: Record<string, unknown> }
+  | { cmd: "ping"; args: Record<string, unknown> }
+  | { cmd: "daemon-status"; args: Record<string, unknown> };
+
+// =============================================================================
+// Response Types
+// =============================================================================
+
+export type DaemonSearchResult = {
+  file: string;
+  displayPath: string;
+  title: string;
+  score: number;
+  hash?: string;
+  docid?: string;
+  chunkPos?: number;
+  body?: string;
+  context?: string | null;
 };
+
+export type DaemonSearchResponse = {
+  results: DaemonSearchResult[];
+  stderr?: string[];
+};
+
+export type DaemonGetResponse = {
+  file: string;
+  title: string;
+  body: string;
+  context: string | null;
+  hash: string;
+  docid: string;
+  startLine: number;
+};
+
+export type DaemonMultiGetItem = {
+  file: string;
+  displayPath: string;
+  title: string;
+  body: string;
+  context: string | null;
+  skipped: boolean;
+  skipReason?: string;
+};
+
+export type DaemonMultiGetResponse = {
+  results: DaemonMultiGetItem[];
+  errors: string[];
+};
+
+export type DaemonLsCollectionsResponse = {
+  mode: "collections";
+  collections: { name: string; fileCount: number }[];
+};
+
+export type DaemonLsFilesResponse = {
+  mode: "files";
+  collectionName: string;
+  pathPrefix: string | null;
+  files: { path: string; title: string; modifiedAt: string; size: number }[];
+};
+
+export type DaemonLsResponse = DaemonLsCollectionsResponse | DaemonLsFilesResponse;
+
+export type DaemonIndexStatus = {
+  collections: { name: string; pattern: string; fileCount: number; lastModified: string }[];
+  totalDocs: number;
+  vectorCount: number;
+  needsEmbedding: number;
+  mostRecent: string | null;
+  contexts: { collection: string; path: string; context: string }[];
+};
+
+export type DaemonPingResponse = {
+  pong: true;
+  pid: number;
+};
+
+export type DaemonResult =
+  | DaemonSearchResponse
+  | DaemonGetResponse
+  | DaemonMultiGetResponse
+  | DaemonLsResponse
+  | DaemonIndexStatus
+  | DaemonStatusRunning
+  | DaemonPingResponse;
 
 /**
  * Success response from daemon
  */
-export type DaemonSuccessResponse = {
+export type DaemonSuccessResponse<Result extends DaemonResult = DaemonResult> = {
   ok: true;
-  result: unknown;
+  result: Result;
 };
 
 /**
@@ -135,14 +224,7 @@ export type DaemonStatusRunning = {
 /**
  * Daemon status when stopped
  */
-export type DaemonStatusStopped = {
-  running: false;
-};
-
-/**
- * Status info returned by daemon status command
- */
-export type DaemonStatus = DaemonStatusRunning | DaemonStatusStopped;
+export type DaemonStatus = DaemonStatusRunning | { running: false };
 
 // =============================================================================
 // Command Classification
@@ -164,6 +246,14 @@ const DAEMON_COMMANDS_LIST = [
 ] as const;
 
 export const DAEMON_COMMANDS: ReadonlySet<string> = new Set(DAEMON_COMMANDS_LIST);
+
+export function isDaemonRequestGeneric(value: unknown): value is DaemonRequestGeneric {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  if (typeof v.cmd !== "string" || !DAEMON_COMMANDS.has(v.cmd)) return false;
+  if (typeof v.args !== "object" || v.args === null || Array.isArray(v.args)) return false;
+  return true;
+}
 
 /**
  * Commands that should NOT use the daemon (mutate state or are long-running)

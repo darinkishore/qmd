@@ -2,10 +2,7 @@
  * Tests for QMD daemon functionality
  */
 
-import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { existsSync, unlinkSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { describe, test, expect } from "bun:test";
 
 // Import protocol types and utilities
 import {
@@ -104,11 +101,29 @@ describe("Protocol: Request/Response types", () => {
   test("DaemonResponse success structure", () => {
     const res: DaemonResponse = {
       ok: true,
-      result: [{ file: "test.md", score: 0.9 }],
+      result: {
+        results: [
+          {
+            file: "qmd://docs/test.md",
+            displayPath: "docs/test.md",
+            title: "Test",
+            score: 0.9,
+          },
+        ],
+      },
     };
     expect(res.ok).toBe(true);
     if (res.ok) {
-      expect(res.result).toEqual([{ file: "test.md", score: 0.9 }]);
+      expect(res.result).toEqual({
+        results: [
+          {
+            file: "qmd://docs/test.md",
+            displayPath: "docs/test.md",
+            title: "Test",
+            score: 0.9,
+          },
+        ],
+      });
     }
   });
 
