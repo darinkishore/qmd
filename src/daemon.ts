@@ -13,6 +13,7 @@ import {
   SOCKET_PATH,
   PID_PATH,
   CACHE_DIR,
+  DAEMON_COMMANDS,
   type DaemonRequest,
   type DaemonResponse,
   type DaemonStatus,
@@ -279,63 +280,137 @@ import {
 // Input Validation Helpers
 // =============================================================================
 
+function describeValue(value: unknown): string {
+  if (value === undefined) return "undefined";
+  if (value === null) return "null";
+  if (typeof value === "string") return `"${value}"`;
+  if (typeof value === "number" && Number.isNaN(value)) return "NaN";
+  return String(value);
+}
+
+function requireNonEmptyString(value: unknown, name: string, hint: string): string {
+  if (value === undefined || value === null) {
+    throw new Error(`Missing required argument: ${name}. ${hint}`);
+  }
+  if (typeof value !== "string") {
+    throw new Error(`Invalid argument: ${name} must be a non-empty string (received ${describeValue(value)}). ${hint}`);
+  }
+  if (!value.trim()) {
+    throw new Error(`Missing required argument: ${name}. ${hint}`);
+  }
+  return value;
+}
+
+function optionalNonEmptyString(value: unknown, name: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") {
+    throw new Error(`Invalid argument: ${name} must be a non-empty string (received ${describeValue(value)}).`);
+  }
+  if (!value.trim()) {
+    throw new Error(`Invalid argument: ${name} must be a non-empty string (received ${describeValue(value)}).`);
+  }
+  return value;
+}
+
+function optionalBoolean(value: unknown, name: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new Error(`Invalid argument: ${name} must be a boolean (received ${describeValue(value)}).`);
+  }
+  return value;
+}
+
+function optionalNumber(
+  value: unknown,
+  name: string,
+  opts: { min?: number; max?: number; integer?: boolean } = {}
+): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`Invalid argument: ${name} must be a finite number (received ${describeValue(value)}).`);
+  }
+  if (opts.integer && !Number.isInteger(value)) {
+    throw new Error(`Invalid argument: ${name} must be an integer (received ${describeValue(value)}).`);
+  }
+  if (opts.min !== undefined && value < opts.min) {
+    throw new Error(`Invalid argument: ${name} must be >= ${opts.min} (received ${describeValue(value)}).`);
+  }
+  if (opts.max !== undefined && value > opts.max) {
+    throw new Error(`Invalid argument: ${name} must be <= ${opts.max} (received ${describeValue(value)}).`);
+  }
+  return value;
+}
+
+/**
+ * Validate and normalize arguments for search/vsearch/query commands.
+ */
 export function validateSearchArgs(args: unknown): SearchArgs {
-  const a = args as Record<string, unknown>;
-  if (typeof a.query !== 'string' || !a.query.trim()) {
-    throw new Error("Missing required argument: query");
-  }
+  const a = (args && typeof args === "object") ? (args as Record<string, unknown>) : {};
+  const query = requireNonEmptyString(a.query, "query", "Provide a non-empty search string.");
   return {
-    query: a.query,
-    limit: typeof a.limit === 'number' ? a.limit : undefined,
-    minScore: typeof a.minScore === 'number' ? a.minScore : undefined,
-    all: typeof a.all === 'boolean' ? a.all : undefined,
-    collection: typeof a.collection === 'string' ? a.collection : undefined,
-    full: typeof a.full === 'boolean' ? a.full : undefined,
-    dbPath: typeof a.dbPath === 'string' ? a.dbPath : undefined,
-    useColor: typeof a.useColor === 'boolean' ? a.useColor : undefined,
-    context: typeof a.context === 'string' ? a.context : undefined,
+    query: query.trim(),
+    limit: optionalNumber(a.limit, "limit", { min: 1, integer: true }),
+    minScore: optionalNumber(a.minScore, "minScore", { min: 0, max: 1 }),
+    all: optionalBoolean(a.all, "all"),
+    collection: optionalNonEmptyString(a.collection, "collection"),
+    full: optionalBoolean(a.full, "full"),
+    dbPath: optionalNonEmptyString(a.dbPath, "dbPath"),
+    useColor: optionalBoolean(a.useColor, "useColor"),
+    context: optionalNonEmptyString(a.context, "context"),
   };
 }
 
+/**
+ * Validate and normalize arguments for get command.
+ */
 export function validateGetArgs(args: unknown): GetArgs {
-  const a = args as Record<string, unknown>;
-  if (typeof a.path !== 'string' || !a.path.trim()) {
-    throw new Error("Missing required argument: path");
-  }
+  const a = (args && typeof args === "object") ? (args as Record<string, unknown>) : {};
+  const path = requireNonEmptyString(a.path, "path", "Provide a file path or qmd:// virtual path.");
   return {
-    path: a.path,
-    fromLine: typeof a.fromLine === 'number' ? a.fromLine : undefined,
-    maxLines: typeof a.maxLines === 'number' ? a.maxLines : undefined,
-    dbPath: typeof a.dbPath === 'string' ? a.dbPath : undefined,
-    cwd: typeof a.cwd === 'string' ? a.cwd : undefined,
+    path,
+    fromLine: optionalNumber(a.fromLine, "fromLine", { min: 1, integer: true }),
+    maxLines: optionalNumber(a.maxLines, "maxLines", { min: 1, integer: true }),
+    dbPath: optionalNonEmptyString(a.dbPath, "dbPath"),
+    cwd: optionalNonEmptyString(a.cwd, "cwd"),
   };
 }
 
+/**
+ * Validate and normalize arguments for multi-get command.
+ */
 export function validateMultiGetArgs(args: unknown): MultiGetArgs {
-  const a = args as Record<string, unknown>;
-  if (typeof a.pattern !== 'string' || !a.pattern.trim()) {
-    throw new Error("Missing required argument: pattern");
-  }
+  const a = (args && typeof args === "object") ? (args as Record<string, unknown>) : {};
+  const pattern = requireNonEmptyString(
+    a.pattern,
+    "pattern",
+    "Provide a glob pattern or a comma-separated list of files."
+  );
   return {
-    pattern: a.pattern,
-    maxLines: typeof a.maxLines === 'number' ? a.maxLines : undefined,
-    maxBytes: typeof a.maxBytes === 'number' ? a.maxBytes : undefined,
-    dbPath: typeof a.dbPath === 'string' ? a.dbPath : undefined,
+    pattern,
+    maxLines: optionalNumber(a.maxLines, "maxLines", { min: 1, integer: true }),
+    maxBytes: optionalNumber(a.maxBytes, "maxBytes", { min: 1, integer: true }),
+    dbPath: optionalNonEmptyString(a.dbPath, "dbPath"),
   };
 }
 
+/**
+ * Validate and normalize arguments for ls command.
+ */
 export function validateLsArgs(args: unknown): LsArgs {
-  const a = args as Record<string, unknown>;
+  const a = (args && typeof args === "object") ? (args as Record<string, unknown>) : {};
   return {
-    path: typeof a.path === 'string' ? a.path : undefined,
-    dbPath: typeof a.dbPath === 'string' ? a.dbPath : undefined,
+    path: optionalNonEmptyString(a.path, "path"),
+    dbPath: optionalNonEmptyString(a.dbPath, "dbPath"),
   };
 }
 
+/**
+ * Validate and normalize arguments for status command.
+ */
 export function validateStatusArgs(args: unknown): { dbPath?: string } {
-  const a = args as Record<string, unknown>;
+  const a = (args && typeof args === "object") ? (args as Record<string, unknown>) : {};
   return {
-    dbPath: typeof a.dbPath === "string" ? a.dbPath : undefined,
+    dbPath: optionalNonEmptyString(a.dbPath, "dbPath"),
   };
 }
 
@@ -386,7 +461,7 @@ async function handleSearch(args: SearchArgs): Promise<unknown> {
   if (args.collection) {
     const coll = getCollectionFromYaml(args.collection);
     if (!coll) {
-      throw new Error(`Collection not found: ${args.collection}`);
+      throw new Error(`Collection not found: ${args.collection}. Run 'qmd collection list' to see available collections.`);
     }
     collectionName = args.collection;
   }
@@ -419,7 +494,7 @@ async function handleVsearch(args: SearchArgs): Promise<unknown> {
   if (args.collection) {
     const coll = getCollectionFromYaml(args.collection);
     if (!coll) {
-      throw new Error(`Collection not found: ${args.collection}`);
+      throw new Error(`Collection not found: ${args.collection}. Run 'qmd collection list' to see available collections.`);
     }
     collectionName = args.collection;
   }
@@ -427,7 +502,7 @@ async function handleVsearch(args: SearchArgs): Promise<unknown> {
   const db = getDb(args.dbPath);
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) {
-    throw new Error("Vector index not found. Run 'qmd embed' first to create embeddings.");
+    throw new Error("Vector index not found. Run 'qmd embed' to create embeddings before using vector search.");
   }
 
   checkIndexHealthWithLogs(db, logger);
@@ -500,7 +575,7 @@ async function handleQuery(args: SearchArgs): Promise<unknown> {
   if (args.collection) {
     const coll = getCollectionFromYaml(args.collection);
     if (!coll) {
-      throw new Error(`Collection not found: ${args.collection}`);
+      throw new Error(`Collection not found: ${args.collection}. Run 'qmd collection list' to see available collections.`);
     }
     collectionName = args.collection;
   }
@@ -708,7 +783,7 @@ async function handleGet(args: GetArgs): Promise<unknown> {
     if (docidMatch) {
       inputPath = docidMatch.filepath;
     } else {
-      throw new Error(`Document not found: ${originalPath}`);
+      throw new Error(`Document not found: ${originalPath}. Try a qmd:// path, a docid (prefix #), or 'qmd ls <collection>'.`);
     }
   }
 
@@ -718,7 +793,7 @@ async function handleGet(args: GetArgs): Promise<unknown> {
   if (isVirtualPath(inputPath)) {
     const parsed = parseVirtualPath(inputPath);
     if (!parsed) {
-      throw new Error(`Invalid virtual path: ${inputPath}`);
+      throw new Error(`Invalid virtual path: ${inputPath}. Expected format: qmd://<collection>/<path>.`);
     }
 
     doc = db.prepare(`
@@ -815,7 +890,7 @@ async function handleGet(args: GetArgs): Promise<unknown> {
   }
 
   if (!doc) {
-    throw new Error(`Document not found: ${originalPath}`);
+    throw new Error(`Document not found: ${originalPath}. Try a qmd:// path, a docid (prefix #), or 'qmd ls <collection>'.`);
   }
 
   const context = getContextForPath(db, doc.collectionName, doc.path);
@@ -854,6 +929,9 @@ async function handleMultiGet(args: MultiGetArgs): Promise<unknown> {
 
   if (isCommaSeparated) {
     const names = args.pattern.split(",").map(s => s.trim()).filter(Boolean);
+    if (names.length === 0) {
+      throw new Error("No files specified in pattern list. Provide a comma-separated list or a glob pattern.");
+    }
     for (const name of names) {
       let doc: { virtual_path: string; body_length: number; collection: string; path: string } | null = null;
 
@@ -918,7 +996,7 @@ async function handleMultiGet(args: MultiGetArgs): Promise<unknown> {
       path: undefined,
     }));
     if (files.length === 0) {
-      throw new Error(`No files matched pattern: ${args.pattern}`);
+      throw new Error(`No files matched pattern: ${args.pattern}. Try 'qmd ls <collection>' to browse files.`);
     }
   }
 
@@ -1019,7 +1097,7 @@ async function handleLs(args: LsArgs): Promise<unknown> {
   if (args.path.startsWith('qmd://')) {
     const parsed = parseVirtualPath(args.path);
     if (!parsed) {
-      throw new Error(`Invalid virtual path: ${args.path}`);
+      throw new Error(`Invalid virtual path: ${args.path}. Expected format: qmd://<collection>/<path>.`);
     }
     collectionName = parsed.collectionName;
     pathPrefix = parsed.path;
@@ -1033,7 +1111,7 @@ async function handleLs(args: LsArgs): Promise<unknown> {
 
   const coll = getCollectionFromYaml(collectionName);
   if (!coll) {
-    throw new Error(`Collection not found: ${collectionName}`);
+    throw new Error(`Collection not found: ${collectionName}. Run 'qmd collection list' to see available collections.`);
   }
 
   let query: string;
@@ -1152,7 +1230,7 @@ async function handleCommand(req: DaemonRequestGeneric): Promise<DaemonResponse>
         result = { pong: true, pid: process.pid };
         break;
       default:
-        throw new Error(`Unknown command: ${req.cmd}`);
+        throw new Error(`Unknown command: ${req.cmd}. Expected one of: ${Array.from(DAEMON_COMMANDS).join(", ")}.`);
     }
 
     if (TRACE) {
@@ -1226,7 +1304,8 @@ function startServer(): void {
             socket.write(JSON.stringify(res) + '\n');
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
-            const res: DaemonResponse = { ok: false, error: `Parse error: ${message}` };
+            const snippet = line.slice(0, 120);
+            const res: DaemonResponse = { ok: false, error: `Parse error: ${message}. Line starts with: ${snippet}` };
             socket.write(JSON.stringify(res) + '\n');
           }
         }
@@ -1315,6 +1394,9 @@ async function stopServer(): Promise<void> {
   process.exit(0);
 }
 
+/**
+ * Start the daemon in the foreground (blocking).
+ */
 export function runDaemonForeground(): void {
   startServer();
 }
@@ -1324,9 +1406,13 @@ export function runDaemonForeground(): void {
 // =============================================================================
 
 /**
- * Send a request to the daemon and get a response
+ * Send a single request to the daemon over the Unix socket.
+ * Throws on connection errors, timeouts, or invalid JSON responses.
  */
 export async function sendToDaemon(req: DaemonRequest, timeoutMs = 30000): Promise<DaemonResponse> {
+  if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error(`Invalid timeoutMs: expected a positive number of milliseconds (received ${describeValue(timeoutMs)}).`);
+  }
   return new Promise((resolve, reject) => {
     let buffer = "";
     let resolved = false;
@@ -1339,7 +1425,7 @@ export async function sendToDaemon(req: DaemonRequest, timeoutMs = 30000): Promi
     const timeout = setTimeout(() => {
       if (!resolved) {
         cleanup();
-        reject(new Error(`Daemon request timed out for '${req.cmd}'`));
+        reject(new Error(`Daemon request timed out after ${timeoutMs}ms for '${req.cmd}'.`));
       }
     }, timeoutMs);
 
@@ -1366,7 +1452,11 @@ export async function sendToDaemon(req: DaemonRequest, timeoutMs = 30000): Promi
           } catch (err) {
             cleanup();
             socket.end();
-            reject(err);
+            const message = err instanceof Error ? err.message : String(err);
+            const snippet = line.slice(0, 120);
+            const wrapped = new Error(`Failed to parse daemon response for '${req.cmd}': ${message}. Line starts with: ${snippet}`);
+            (wrapped as any).cause = err;
+            reject(wrapped);
           }
         },
         error(socket, error) {
@@ -1380,13 +1470,13 @@ export async function sendToDaemon(req: DaemonRequest, timeoutMs = 30000): Promi
         close() {
           if (!resolved) {
             cleanup();
-            reject(new Error(`Connection closed by daemon before response for '${req.cmd}'`));
+            reject(new Error(`Connection closed by daemon before response for '${req.cmd}'.`));
           }
         },
         connectError(socket, error) {
           if (!resolved) {
             cleanup();
-            const wrapped = new Error(`Failed to connect to daemon for '${req.cmd}': ${error.message || error}`);
+            const wrapped = new Error(`Failed to connect to daemon for '${req.cmd}': ${error.message || error}. Is the daemon running?`);
             (wrapped as any).cause = error;
             reject(wrapped);
           }
@@ -1397,7 +1487,7 @@ export async function sendToDaemon(req: DaemonRequest, timeoutMs = 30000): Promi
 }
 
 /**
- * Clean up stale socket and PID files
+ * Remove stale socket and PID files if they exist.
  */
 export function cleanupStaleFiles(): void {
   try {
@@ -1415,7 +1505,7 @@ export function cleanupStaleFiles(): void {
 }
 
 /**
- * Check if daemon is running
+ * Returns true if the daemon appears to be running and its PID is alive.
  */
 export function isDaemonRunning(): boolean {
   if (!existsSync(SOCKET_PATH)) return false;
@@ -1446,7 +1536,7 @@ export function isDaemonRunning(): boolean {
 }
 
 /**
- * Get daemon status
+ * Fetch daemon status over the socket. Returns { running: false } on failure.
  */
 export async function getDaemonStatus(): Promise<DaemonStatus> {
   if (!isDaemonRunning()) {
@@ -1470,18 +1560,19 @@ export async function getDaemonStatus(): Promise<DaemonStatus> {
 }
 
 /**
- * Stop the daemon. Returns { stopped: true } on success, { stopped: false, reason: string } on failure.
+ * Stop the daemon by sending SIGTERM to the PID file process.
  */
 export function stopDaemon(): { stopped: boolean; reason?: string } {
   if (!existsSync(PID_PATH)) {
-    return { stopped: false, reason: "No PID file found" };
+    return { stopped: false, reason: "No PID file found (daemon not running?)" };
   }
 
   try {
     const pidContent = readFileSync(PID_PATH, 'utf-8').trim();
     const pid = parseInt(pidContent, 10);
     if (isNaN(pid)) {
-      return { stopped: false, reason: "Invalid PID file content" };
+      cleanupStaleFiles();
+      return { stopped: false, reason: "Invalid PID file content (stale files removed)" };
     }
     process.kill(pid, 'SIGTERM');
     return { stopped: true };

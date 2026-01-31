@@ -155,12 +155,12 @@ describe("Daemon: cleanupStaleFiles", () => {
 describe("Daemon: Input validation", () => {
   test("validateSearchArgs throws on missing query", async () => {
     const { validateSearchArgs } = await import("./daemon");
-    expect(() => validateSearchArgs({})).toThrow("Missing required argument: query");
+    expect(() => validateSearchArgs({})).toThrow(/Missing required argument: query/i);
   });
 
   test("validateSearchArgs throws on empty query", async () => {
     const { validateSearchArgs } = await import("./daemon");
-    expect(() => validateSearchArgs({ query: "   " })).toThrow("Missing required argument: query");
+    expect(() => validateSearchArgs({ query: "   " })).toThrow(/Missing required argument: query/i);
   });
 
   test("validateSearchArgs extracts valid args", async () => {
@@ -181,12 +181,12 @@ describe("Daemon: Input validation", () => {
 
   test("validateGetArgs throws on missing path", async () => {
     const { validateGetArgs } = await import("./daemon");
-    expect(() => validateGetArgs({})).toThrow("Missing required argument: path");
+    expect(() => validateGetArgs({})).toThrow(/Missing required argument: path/i);
   });
 
   test("validateGetArgs throws on empty path", async () => {
     const { validateGetArgs } = await import("./daemon");
-    expect(() => validateGetArgs({ path: "  " })).toThrow("Missing required argument: path");
+    expect(() => validateGetArgs({ path: "  " })).toThrow(/Missing required argument: path/i);
   });
 
   test("validateGetArgs extracts valid args", async () => {
@@ -206,7 +206,7 @@ describe("Daemon: Input validation", () => {
 
   test("validateMultiGetArgs throws on missing pattern", async () => {
     const { validateMultiGetArgs } = await import("./daemon");
-    expect(() => validateMultiGetArgs({})).toThrow("Missing required argument: pattern");
+    expect(() => validateMultiGetArgs({})).toThrow(/Missing required argument: pattern/i);
   });
 
   test("validateMultiGetArgs extracts valid args", async () => {
@@ -218,7 +218,24 @@ describe("Daemon: Input validation", () => {
 
   test("validateMultiGetArgs throws on empty pattern", async () => {
     const { validateMultiGetArgs } = await import("./daemon");
-    expect(() => validateMultiGetArgs({ pattern: "   " })).toThrow("Missing required argument: pattern");
+    expect(() => validateMultiGetArgs({ pattern: "   " })).toThrow(/Missing required argument: pattern/i);
+  });
+
+  test("validateSearchArgs rejects invalid numeric args", async () => {
+    const { validateSearchArgs } = await import("./daemon");
+    expect(() => validateSearchArgs({ query: "test", limit: 0 })).toThrow(/limit/i);
+    expect(() => validateSearchArgs({ query: "test", minScore: 2 })).toThrow(/minScore/i);
+  });
+
+  test("validateGetArgs rejects invalid line arguments", async () => {
+    const { validateGetArgs } = await import("./daemon");
+    expect(() => validateGetArgs({ path: "file.md", fromLine: 0 })).toThrow(/fromLine/i);
+    expect(() => validateGetArgs({ path: "file.md", maxLines: -3 })).toThrow(/maxLines/i);
+  });
+
+  test("validateMultiGetArgs rejects invalid maxBytes", async () => {
+    const { validateMultiGetArgs } = await import("./daemon");
+    expect(() => validateMultiGetArgs({ pattern: "*.md", maxBytes: 0 })).toThrow(/maxBytes/i);
   });
 
   test("validateLsArgs handles optional path", async () => {

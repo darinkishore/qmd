@@ -59,6 +59,28 @@ qmd query "error handling" --all --files --min-score 0.4
 qmd get "docs/api-reference.md" --full
 ```
 
+### Daemon
+
+The daemon keeps models loaded and serves queries over a Unix socket for fast, repeated searches.
+It is optional, but recommended if you run many searches in a row.
+
+```sh
+# Start the daemon (foreground)
+qmd daemon run
+
+# Check status (works even if the daemon is not running)
+qmd daemon status
+
+# Ping the daemon
+qmd daemon ping
+
+# Stop the daemon
+qmd daemon stop
+
+# Clean up stale socket/PID files
+qmd daemon cleanup
+```
+
 ### MCP Server
 
 Although the tool works perfectly fine when you just tell your agent to use it on the command line, it also exposes an MCP (Model Context Protocol) server for tighter integration.

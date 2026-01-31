@@ -181,7 +181,8 @@ const NON_DAEMON_COMMANDS_LIST = [
 export const NON_DAEMON_COMMANDS: ReadonlySet<string> = new Set(NON_DAEMON_COMMANDS_LIST);
 
 /**
- * Check if a command should use the daemon
+ * Decide whether a CLI command should be routed through the daemon.
+ * Returns true for explicitly supported read-only commands.
  */
 export function shouldUseDaemon(cmd: string): boolean {
   // Explicit allow list takes priority
