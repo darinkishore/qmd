@@ -37,6 +37,7 @@ import {
   getCachedResult,
   setCachedResult,
   getIndexHealth,
+  getDocumentBody,
   parseVirtualPath,
   buildVirtualPath,
   isVirtualPath,
@@ -82,6 +83,15 @@ import {
   setGlobalContext,
   listAllContexts,
 } from "./collections.js";
+import { shouldUseDaemon } from "./protocol.js";
+import {
+  cleanupStaleFiles,
+  getDaemonStatus,
+  isDaemonRunning,
+  runDaemonForeground,
+  sendToDaemon,
+  stopDaemon,
+} from "./daemon.js";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
@@ -270,52 +280,38 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
-function showStatus(): void {
-  const dbPath = getDbPath();
-  const db = getDb();
+type StatusPayload = {
+  collections: { name: string; pattern: string; fileCount: number; lastModified: string | null }[];
+  totalDocs: number;
+  vectorCount: number;
+  needsEmbedding: number;
+  mostRecent: string | null;
+  contexts: { collection: string; path: string; context: string }[];
+};
 
-  // Collections are defined in YAML; no duplicate cleanup needed.
-  // Collections are defined in YAML; no duplicate cleanup needed.
-
-  // Index size
+function outputStatus(payload: StatusPayload, dbPath: string): void {
   let indexSize = 0;
   try {
-    const stat = Bun.file(dbPath).size;
-    indexSize = stat;
+    indexSize = Bun.file(dbPath).size;
   } catch { }
-
-  // Collections info (from YAML + database stats)
-  const collections = listCollections(db);
-
-  // Overall stats
-  const totalDocs = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
-  const vectorCount = db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number };
-  const needsEmbedding = getHashesNeedingEmbedding(db);
-
-  // Most recent update across all collections
-  const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
 
   console.log(`${c.bold}QMD Status${c.reset}\n`);
   console.log(`Index: ${dbPath}`);
   console.log(`Size:  ${formatBytes(indexSize)}\n`);
 
   console.log(`${c.bold}Documents${c.reset}`);
-  console.log(`  Total:    ${totalDocs.count} files indexed`);
-  console.log(`  Vectors:  ${vectorCount.count} embedded`);
-  if (needsEmbedding > 0) {
-    console.log(`  ${c.yellow}Pending:  ${needsEmbedding} need embedding${c.reset} (run 'qmd embed')`);
+  console.log(`  Total:    ${payload.totalDocs} files indexed`);
+  console.log(`  Vectors:  ${payload.vectorCount} embedded`);
+  if (payload.needsEmbedding > 0) {
+    console.log(`  ${c.yellow}Pending:  ${payload.needsEmbedding} need embedding${c.reset} (run 'qmd embed')`);
   }
-  if (mostRecent.latest) {
-    const lastUpdate = new Date(mostRecent.latest);
+  if (payload.mostRecent) {
+    const lastUpdate = new Date(payload.mostRecent);
     console.log(`  Updated:  ${formatTimeAgo(lastUpdate)}`);
   }
 
-  // Get all contexts grouped by collection (from YAML)
-  const allContexts = listAllContexts();
   const contextsByCollection = new Map<string, { path_prefix: string; context: string }[]>();
-
-  for (const ctx of allContexts) {
-    // Group contexts by collection name
+  for (const ctx of payload.contexts) {
     if (!contextsByCollection.has(ctx.collection)) {
       contextsByCollection.set(ctx.collection, []);
     }
@@ -325,20 +321,19 @@ function showStatus(): void {
     });
   }
 
-  if (collections.length > 0) {
+  if (payload.collections.length > 0) {
     console.log(`\n${c.bold}Collections${c.reset}`);
-    for (const col of collections) {
-      const lastMod = col.last_modified ? formatTimeAgo(new Date(col.last_modified)) : "never";
+    for (const col of payload.collections) {
+      const lastMod = col.lastModified ? formatTimeAgo(new Date(col.lastModified)) : "never";
       const contexts = contextsByCollection.get(col.name) || [];
 
       console.log(`  ${c.cyan}${col.name}${c.reset} ${c.dim}(qmd://${col.name}/)${c.reset}`);
-      console.log(`    ${c.dim}Pattern:${c.reset}  ${col.glob_pattern}`);
-      console.log(`    ${c.dim}Files:${c.reset}    ${col.active_count} (updated ${lastMod})`);
+      console.log(`    ${c.dim}Pattern:${c.reset}  ${col.pattern}`);
+      console.log(`    ${c.dim}Files:${c.reset}    ${col.fileCount} (updated ${lastMod})`);
 
       if (contexts.length > 0) {
         console.log(`    ${c.dim}Contexts:${c.reset} ${contexts.length}`);
         for (const ctx of contexts) {
-          // Handle both empty string and '/' as root context
           const pathDisplay = (ctx.path_prefix === '' || ctx.path_prefix === '/') ? '/' : `/${ctx.path_prefix}`;
           const contextPreview = ctx.context.length > 60
             ? ctx.context.substring(0, 57) + '...'
@@ -348,25 +343,50 @@ function showStatus(): void {
       }
     }
 
-    // Show examples of virtual paths
     console.log(`\n${c.bold}Examples${c.reset}`);
     console.log(`  ${c.dim}# List files in a collection${c.reset}`);
-    if (collections.length > 0 && collections[0]) {
-      console.log(`  qmd ls ${collections[0].name}`);
+    if (payload.collections.length > 0 && payload.collections[0]) {
+      console.log(`  qmd ls ${payload.collections[0].name}`);
     }
     console.log(`  ${c.dim}# Get a document${c.reset}`);
-    if (collections.length > 0 && collections[0]) {
-      console.log(`  qmd get qmd://${collections[0].name}/path/to/file.md`);
+    if (payload.collections.length > 0 && payload.collections[0]) {
+      console.log(`  qmd get qmd://${payload.collections[0].name}/path/to/file.md`);
     }
     console.log(`  ${c.dim}# Search within a collection${c.reset}`);
-    if (collections.length > 0 && collections[0]) {
-      console.log(`  qmd search "query" -c ${collections[0].name}`);
+    if (payload.collections.length > 0 && payload.collections[0]) {
+      console.log(`  qmd search "query" -c ${payload.collections[0].name}`);
     }
   } else {
     console.log(`\n${c.dim}No collections. Run 'qmd collection add .' to index markdown files.${c.reset}`);
   }
+}
+
+function showStatus(): void {
+  const dbPath = getDbPath();
+  const db = getDb();
+
+  const collections = listCollections(db);
+  const totalDocs = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
+  const vectorCount = db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number };
+  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
+  const contexts = listAllContexts();
 
   closeDb();
+
+  outputStatus({
+    collections: collections.map(col => ({
+      name: col.name,
+      pattern: col.glob_pattern,
+      fileCount: col.active_count,
+      lastModified: col.last_modified,
+    })),
+    totalDocs: totalDocs.count,
+    vectorCount: vectorCount.count,
+    needsEmbedding,
+    mostRecent: mostRecent.latest,
+    contexts,
+  }, dbPath);
 }
 
 async function updateCollections(): Promise<void> {
@@ -685,6 +705,26 @@ function contextCheck(): void {
   closeDb();
 }
 
+type GetOutput = {
+  body: string;
+  context?: string | null;
+  startLine?: number;
+};
+
+function outputGetDocument(doc: GetOutput, lineNumbers?: boolean): void {
+  const startLine = doc.startLine ?? 1;
+  let output = doc.body;
+
+  if (lineNumbers) {
+    output = addLineNumbers(output, startLine);
+  }
+
+  if (doc.context) {
+    console.log(`Folder Context: ${doc.context}\n---\n`);
+  }
+  console.log(output);
+}
+
 function getDocument(filename: string, fromLine?: number, maxLines?: number, lineNumbers?: boolean): void {
   const db = getDb();
 
@@ -852,17 +892,96 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
     output = lines.slice(start, end).join('\n');
   }
 
-  // Add line numbers if requested
-  if (lineNumbers) {
-    output = addLineNumbers(output, startLine);
-  }
-
-  // Output context header if exists
-  if (context) {
-    console.log(`Folder Context: ${context}\n---\n`);
-  }
-  console.log(output);
+  outputGetDocument({ body: output, context, startLine }, lineNumbers);
   closeDb();
+}
+
+type MultiGetResultItem = {
+  file: string;
+  displayPath: string;
+  title: string;
+  body: string;
+  context: string | null;
+  skipped: boolean;
+  skipReason?: string;
+};
+
+function outputMultiGetResults(results: MultiGetResultItem[], format: OutputFormat): void {
+  if (format === "json") {
+    const output = results.map(r => ({
+      file: r.displayPath,
+      title: r.title,
+      ...(r.context && { context: r.context }),
+      ...(r.skipped ? { skipped: true, reason: r.skipReason } : { body: r.body }),
+    }));
+    console.log(JSON.stringify(output, null, 2));
+  } else if (format === "csv") {
+    const escapeField = (val: string | null | undefined): string => {
+      if (val === null || val === undefined) return "";
+      const str = String(val);
+      if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    };
+    console.log("file,title,context,skipped,body");
+    for (const r of results) {
+      console.log([r.displayPath, r.title, r.context, r.skipped ? "true" : "false", r.skipped ? r.skipReason : r.body].map(escapeField).join(","));
+    }
+  } else if (format === "files") {
+    for (const r of results) {
+      const ctx = r.context ? `,"${r.context.replace(/"/g, '""')}"` : "";
+      const status = r.skipped ? "[SKIPPED]" : "";
+      console.log(`${r.displayPath}${ctx}${status ? `,${status}` : ""}`);
+    }
+  } else if (format === "md") {
+    for (const r of results) {
+      console.log(`## ${r.displayPath}\n`);
+      if (r.title && r.title !== r.displayPath) console.log(`**Title:** ${r.title}\n`);
+      if (r.context) console.log(`**Context:** ${r.context}\n`);
+      if (r.skipped) {
+        console.log(`> ${r.skipReason}\n`);
+      } else {
+        console.log("```");
+        console.log(r.body);
+        console.log("```\n");
+      }
+    }
+  } else if (format === "xml") {
+    console.log('<?xml version="1.0" encoding="UTF-8"?>');
+    console.log("<documents>");
+    for (const r of results) {
+      console.log("  <document>");
+      console.log(`    <file>${escapeXml(r.displayPath)}</file>`);
+      console.log(`    <title>${escapeXml(r.title)}</title>`);
+      if (r.context) console.log(`    <context>${escapeXml(r.context)}</context>`);
+      if (r.skipped) {
+        console.log(`    <skipped>true</skipped>`);
+        console.log(`    <reason>${escapeXml(r.skipReason || "")}</reason>`);
+      } else {
+        console.log(`    <body>${escapeXml(r.body)}</body>`);
+      }
+      console.log("  </document>");
+    }
+    console.log("</documents>");
+  } else {
+    // CLI format (default)
+    for (const r of results) {
+      console.log(`\n${'='.repeat(60)}`);
+      console.log(`File: ${r.displayPath}`);
+      console.log(`${'='.repeat(60)}\n`);
+
+      if (r.skipped) {
+        console.log(`[SKIPPED: ${r.skipReason}]`);
+        continue;
+      }
+
+      if (r.context) {
+        console.log(`Folder Context: ${r.context}\n---\n`);
+      }
+      console.log(r.body);
+    }
+  }
 }
 
 // Multi-get: fetch multiple documents by glob pattern or comma-separated list
@@ -954,7 +1073,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
   }
 
   // Collect results for structured output
-  const results: { file: string; displayPath: string; title: string; body: string; context: string | null; skipped: boolean; skipReason?: string }[] = [];
+  const results: MultiGetResultItem[] = [];
 
   for (const file of files) {
     // Parse virtual path to get collection info if not already available
@@ -1021,81 +1140,53 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
 
   closeDb();
 
-  // Output based on format
-  if (format === "json") {
-    const output = results.map(r => ({
-      file: r.displayPath,
-      title: r.title,
-      ...(r.context && { context: r.context }),
-      ...(r.skipped ? { skipped: true, reason: r.skipReason } : { body: r.body }),
-    }));
-    console.log(JSON.stringify(output, null, 2));
-  } else if (format === "csv") {
-    const escapeField = (val: string | null | undefined): string => {
-      if (val === null || val === undefined) return "";
-      const str = String(val);
-      if (str.includes(",") || str.includes('"') || str.includes("\n")) {
-        return `"${str.replace(/"/g, '""')}"`;
-      }
-      return str;
-    };
-    console.log("file,title,context,skipped,body");
-    for (const r of results) {
-      console.log([r.displayPath, r.title, r.context, r.skipped ? "true" : "false", r.skipped ? r.skipReason : r.body].map(escapeField).join(","));
-    }
-  } else if (format === "files") {
-    for (const r of results) {
-      const ctx = r.context ? `,"${r.context.replace(/"/g, '""')}"` : "";
-      const status = r.skipped ? "[SKIPPED]" : "";
-      console.log(`${r.displayPath}${ctx}${status ? `,${status}` : ""}`);
-    }
-  } else if (format === "md") {
-    for (const r of results) {
-      console.log(`## ${r.displayPath}\n`);
-      if (r.title && r.title !== r.displayPath) console.log(`**Title:** ${r.title}\n`);
-      if (r.context) console.log(`**Context:** ${r.context}\n`);
-      if (r.skipped) {
-        console.log(`> ${r.skipReason}\n`);
-      } else {
-        console.log("```");
-        console.log(r.body);
-        console.log("```\n");
-      }
-    }
-  } else if (format === "xml") {
-    console.log('<?xml version="1.0" encoding="UTF-8"?>');
-    console.log("<documents>");
-    for (const r of results) {
-      console.log("  <document>");
-      console.log(`    <file>${escapeXml(r.displayPath)}</file>`);
-      console.log(`    <title>${escapeXml(r.title)}</title>`);
-      if (r.context) console.log(`    <context>${escapeXml(r.context)}</context>`);
-      if (r.skipped) {
-        console.log(`    <skipped>true</skipped>`);
-        console.log(`    <reason>${escapeXml(r.skipReason || "")}</reason>`);
-      } else {
-        console.log(`    <body>${escapeXml(r.body)}</body>`);
-      }
-      console.log("  </document>");
-    }
-    console.log("</documents>");
-  } else {
-    // CLI format (default)
-    for (const r of results) {
-      console.log(`\n${'='.repeat(60)}`);
-      console.log(`File: ${r.displayPath}`);
-      console.log(`${'='.repeat(60)}\n`);
+  outputMultiGetResults(results, format);
+}
 
-      if (r.skipped) {
-        console.log(`[SKIPPED: ${r.skipReason}]`);
-        continue;
-      }
+type LsCollectionsResult = {
+  mode: "collections";
+  collections: { name: string; fileCount: number }[];
+};
 
-      if (r.context) {
-        console.log(`Folder Context: ${r.context}\n---\n`);
-      }
-      console.log(r.body);
+type LsFilesResult = {
+  mode: "files";
+  collectionName: string;
+  pathPrefix: string | null;
+  files: { path: string; title: string; modifiedAt: string; size: number }[];
+};
+
+type LsResult = LsCollectionsResult | LsFilesResult;
+
+function outputLsResult(result: LsResult): void {
+  if (result.mode === "collections") {
+    if (result.collections.length === 0) {
+      console.log("No collections found. Run 'qmd add .' to index files.");
+      return;
     }
+
+    console.log(`${c.bold}Collections:${c.reset}\n`);
+    for (const coll of result.collections) {
+      console.log(`  ${c.dim}qmd://${c.reset}${c.cyan}${coll.name}/${c.reset}  ${c.dim}(${coll.fileCount} files)${c.reset}`);
+    }
+    return;
+  }
+
+  const files = result.files;
+  if (files.length === 0) {
+    if (result.pathPrefix) {
+      console.log(`No files found under qmd://${result.collectionName}/${result.pathPrefix}`);
+    } else {
+      console.log(`No files found in collection: ${result.collectionName}`);
+    }
+    return;
+  }
+
+  const maxSize = Math.max(...files.map(f => formatBytes(f.size).length));
+  for (const file of files) {
+    const sizeStr = formatBytes(file.size).padStart(maxSize);
+    const date = new Date(file.modifiedAt);
+    const timeStr = formatLsTime(date);
+    console.log(`${sizeStr}  ${timeStr}  ${c.dim}qmd://${result.collectionName}/${c.reset}${c.cyan}${file.path}${c.reset}`);
   }
 }
 
@@ -1107,13 +1198,6 @@ function listFiles(pathArg?: string): void {
     // No argument - list all collections
     const yamlCollections = yamlListCollections();
 
-    if (yamlCollections.length === 0) {
-      console.log("No collections found. Run 'qmd add .' to index files.");
-      closeDb();
-      return;
-    }
-
-    // Get file counts from database for each collection
     const collections = yamlCollections.map(coll => {
       const stats = db.prepare(`
         SELECT COUNT(*) as file_count
@@ -1123,14 +1207,11 @@ function listFiles(pathArg?: string): void {
 
       return {
         name: coll.name,
-        file_count: stats?.file_count || 0
+        fileCount: stats?.file_count || 0
       };
     });
 
-    console.log(`${c.bold}Collections:${c.reset}\n`);
-    for (const coll of collections) {
-      console.log(`  ${c.dim}qmd://${c.reset}${c.cyan}${coll.name}/${c.reset}  ${c.dim}(${coll.file_count} files)${c.reset}`);
-    }
+    outputLsResult({ mode: "collections", collections });
     closeDb();
     return;
   }
@@ -1195,28 +1276,17 @@ function listFiles(pathArg?: string): void {
 
   const files = db.prepare(query).all(...params) as { path: string; title: string; modified_at: string; size: number }[];
 
-  if (files.length === 0) {
-    if (pathPrefix) {
-      console.log(`No files found under qmd://${collectionName}/${pathPrefix}`);
-    } else {
-      console.log(`No files found in collection: ${collectionName}`);
-    }
-    closeDb();
-    return;
-  }
-
-  // Calculate max widths for alignment
-  const maxSize = Math.max(...files.map(f => formatBytes(f.size).length));
-
-  // Output in ls -l style
-  for (const file of files) {
-    const sizeStr = formatBytes(file.size).padStart(maxSize);
-    const date = new Date(file.modified_at);
-    const timeStr = formatLsTime(date);
-
-    // Dim the qmd:// prefix, highlight the filename
-    console.log(`${sizeStr}  ${timeStr}  ${c.dim}qmd://${collectionName}/${c.reset}${c.cyan}${file.path}${c.reset}`);
-  }
+  outputLsResult({
+    mode: "files",
+    collectionName,
+    pathPrefix,
+    files: files.map(f => ({
+      path: f.path,
+      title: f.title,
+      modifiedAt: f.modified_at,
+      size: f.size,
+    })),
+  });
 
   closeDb();
 }
@@ -1241,29 +1311,44 @@ function formatLsTime(date: Date): string {
   }
 }
 
+type CollectionListItem = {
+  name: string;
+  pattern: string;
+  fileCount: number;
+  lastModified: string | null;
+};
+
+function outputCollectionList(items: CollectionListItem[]): void {
+  if (items.length === 0) {
+    console.log("No collections found. Run 'qmd add .' to create one.");
+    return;
+  }
+
+  console.log(`${c.bold}Collections (${items.length}):${c.reset}\n`);
+
+  for (const coll of items) {
+    const updatedAt = coll.lastModified ? new Date(coll.lastModified) : new Date();
+    const timeAgo = formatTimeAgo(updatedAt);
+
+    console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(qmd://${coll.name}/)${c.reset}`);
+    console.log(`  ${c.dim}Pattern:${c.reset}  ${coll.pattern}`);
+    console.log(`  ${c.dim}Files:${c.reset}    ${coll.fileCount}`);
+    console.log(`  ${c.dim}Updated:${c.reset}  ${timeAgo}`);
+    console.log();
+  }
+}
+
 // Collection management commands
 function collectionList(): void {
   const db = getDb();
   const collections = listCollections(db);
 
-  if (collections.length === 0) {
-    console.log("No collections found. Run 'qmd add .' to create one.");
-    closeDb();
-    return;
-  }
-
-  console.log(`${c.bold}Collections (${collections.length}):${c.reset}\n`);
-
-  for (const coll of collections) {
-    const updatedAt = coll.last_modified ? new Date(coll.last_modified) : new Date();
-    const timeAgo = formatTimeAgo(updatedAt);
-
-    console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(qmd://${coll.name}/)${c.reset}`);
-    console.log(`  ${c.dim}Pattern:${c.reset}  ${coll.glob_pattern}`);
-    console.log(`  ${c.dim}Files:${c.reset}    ${coll.active_count}`);
-    console.log(`  ${c.dim}Updated:${c.reset}  ${timeAgo}`);
-    console.log();
-  }
+  outputCollectionList(collections.map(coll => ({
+    name: coll.name,
+    pattern: coll.glob_pattern,
+    fileCount: coll.active_count,
+    lastModified: coll.last_modified,
+  })));
 
   closeDb();
 }
@@ -1790,7 +1875,7 @@ function addLineNumbers(text: string, startLine: number = 1): string {
   return lines.map((line, i) => `${startLine + i}: ${line}`).join('\n');
 }
 
-function outputResults(results: { file: string; displayPath: string; title: string; body: string; score: number; context?: string | null; chunkPos?: number; hash?: string; docid?: string }[], query: string, opts: OutputOptions): void {
+function outputResults(results: { file: string; displayPath: string; title: string; body?: string; snippet?: string; line?: number; score: number; context?: string | null; chunkPos?: number; hash?: string; docid?: string }[], query: string, opts: OutputOptions): void {
   const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
 
   if (filtered.length === 0) {
@@ -1806,10 +1891,10 @@ function outputResults(results: { file: string; displayPath: string; title: stri
     const output = filtered.map(row => {
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
       let body = opts.full ? row.body : undefined;
-      let snippet = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos).snippet : undefined;
+      let snippet = !opts.full ? (row.snippet ?? (row.body ? extractSnippet(row.body, query, 300, row.chunkPos).snippet : "")) : undefined;
       if (opts.lineNumbers) {
         if (body) body = addLineNumbers(body);
-        if (snippet) snippet = addLineNumbers(snippet);
+        if (snippet) snippet = addLineNumbers(snippet, row.line ?? 1);
       }
       return {
         ...(docid && { docid: `#${docid}` }),
@@ -1833,7 +1918,10 @@ function outputResults(results: { file: string; displayPath: string; title: stri
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
       if (!row) continue;
-      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
+      const snippetInfo = row.snippet
+        ? { line: row.line ?? 1, snippet: row.snippet }
+        : (row.body ? extractSnippet(row.body, query, 500, row.chunkPos) : { line: 1, snippet: "" });
+      const { line, snippet } = snippetInfo;
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
 
       // Line 1: filepath with docid
@@ -1874,9 +1962,11 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       if (!row) continue;
       const heading = row.title || row.displayPath;
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
-      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
+      let content = opts.full
+        ? (row.body ?? "")
+        : (row.snippet ?? (row.body ? extractSnippet(row.body, query, 500, row.chunkPos).snippet : ""));
       if (opts.lineNumbers) {
-        content = addLineNumbers(content);
+        content = addLineNumbers(content, opts.full ? 1 : (row.line ?? 1));
       }
       const docidLine = docid ? `**docid:** \`#${docid}\`\n` : "";
       const contextLine = row.context ? `**context:** ${row.context}\n` : "";
@@ -1887,9 +1977,11 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       const titleAttr = row.title ? ` title="${row.title.replace(/"/g, '&quot;')}"` : "";
       const contextAttr = row.context ? ` context="${row.context.replace(/"/g, '&quot;')}"` : "";
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
-      let content = opts.full ? row.body : extractSnippet(row.body, query, 500, row.chunkPos).snippet;
+      let content = opts.full
+        ? (row.body ?? "")
+        : (row.snippet ?? (row.body ? extractSnippet(row.body, query, 500, row.chunkPos).snippet : ""));
       if (opts.lineNumbers) {
-        content = addLineNumbers(content);
+        content = addLineNumbers(content, opts.full ? 1 : (row.line ?? 1));
       }
       console.log(`<file docid="#${docid}" name="${toQmdPath(row.displayPath)}"${titleAttr}${contextAttr}>\n${content}\n</file>\n`);
     }
@@ -1897,15 +1989,329 @@ function outputResults(results: { file: string; displayPath: string; title: stri
     // CSV format
     console.log("docid,score,file,title,context,line,snippet");
     for (const row of filtered) {
-      const { line, snippet } = extractSnippet(row.body, query, 500, row.chunkPos);
-      let content = opts.full ? row.body : snippet;
+      const snippetInfo = row.snippet
+        ? { line: row.line ?? 1, snippet: row.snippet }
+        : (row.body ? extractSnippet(row.body, query, 500, row.chunkPos) : { line: 1, snippet: "" });
+      const { line, snippet } = snippetInfo;
+      let content = opts.full ? (row.body ?? "") : snippet;
       if (opts.lineNumbers) {
-        content = addLineNumbers(content, line);
+        const lineStart = opts.full ? 1 : line;
+        content = addLineNumbers(content, lineStart);
       }
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : "");
       const snippetText = content || "";
       console.log(`#${docid},${row.score.toFixed(4)},${escapeCSV(toQmdPath(row.displayPath))},${escapeCSV(row.title || "")},${escapeCSV(row.context || "")},${line},${escapeCSV(snippetText)}`);
     }
+  }
+}
+
+type DaemonSearchResult = {
+  file?: string;
+  displayPath?: string;
+  title?: string;
+  score?: number;
+  hash?: string;
+  docid?: string;
+  chunkPos?: number;
+  body?: string;
+  context?: string | null;
+};
+
+type DaemonSearchPayload = {
+  results: DaemonSearchResult[];
+  stderr?: string[];
+};
+
+function normalizeDaemonSearchResults(results: DaemonSearchResult[]): { file: string; displayPath: string; title: string; score: number; chunkPos?: number; hash?: string; docid?: string; body?: string; context?: string | null }[] {
+  return results
+    .map((r) => {
+      const displayPath = r.displayPath
+        ?? (typeof r.file === "string" && r.file.startsWith("qmd://") ? r.file.slice("qmd://".length) : undefined)
+        ?? (typeof r.file === "string" ? r.file : "");
+      return {
+        file: r.file ?? `qmd://${displayPath}`,
+        displayPath,
+        title: r.title ?? "",
+        score: typeof r.score === "number" ? r.score : 0,
+        chunkPos: r.chunkPos,
+        hash: r.hash,
+        docid: r.docid,
+        body: r.body,
+        context: r.context,
+      };
+    })
+    .filter((r) => r.displayPath.length > 0);
+}
+
+async function tryDaemonSearchCommand(cmd: "search" | "vsearch" | "query", query: string, opts: OutputOptions): Promise<boolean> {
+  if (!shouldUseDaemon(cmd)) return false;
+  if (!isDaemonRunning()) return false;
+
+  const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
+  try {
+    const res = await sendToDaemon({
+      cmd,
+      args: {
+        query,
+        limit: fetchLimit,
+        minScore: opts.minScore,
+        collection: opts.collection,
+        full: false,
+        dbPath: getDbPath(),
+        useColor,
+        context: opts.context,
+      },
+    });
+
+    if (!res.ok) {
+      const message = res.error;
+      if (cmd === "vsearch" && message.includes("Vector index not found")) {
+        console.error(message);
+        return true;
+      }
+      if (message.startsWith("Collection not found:")) {
+        console.error(message);
+        process.exit(1);
+      }
+      console.error(message);
+      process.exit(1);
+    }
+
+    const payload = res.result as DaemonSearchPayload;
+    if (!payload || typeof payload !== "object" || !Array.isArray(payload.results)) {
+      return false;
+    }
+
+    if (payload.stderr) {
+      for (const line of payload.stderr) {
+        process.stderr.write(line);
+      }
+    }
+
+    const normalized = normalizeDaemonSearchResults(payload.results);
+    if (normalized.length === 0) {
+      console.log("No results found.");
+      return true;
+    }
+
+    const filtered = opts.all
+      ? normalized.filter(r => r.score >= opts.minScore)
+      : normalized.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
+
+    const needsBody = opts.format !== "files";
+    const needsContext = true;
+    const shouldEnrich = filtered.some(r => (needsBody && r.body === undefined) || (needsContext && r.context === undefined));
+
+    let enriched = filtered;
+    if (shouldEnrich) {
+      const db = getDb();
+      enriched = filtered.map((r) => {
+        const virtualPath = r.file.startsWith("qmd://") ? r.file : `qmd://${r.displayPath}`;
+        const body = (needsBody && r.body === undefined) ? (getDocumentBody(db, { filepath: virtualPath }) ?? "") : r.body;
+        let context = r.context;
+        if (needsContext && context === undefined) {
+          const parsed = parseVirtualPath(virtualPath);
+          if (parsed) {
+            context = getContextForPath(db, parsed.collectionName, parsed.path);
+          } else {
+            context = null;
+          }
+        }
+        return {
+          ...r,
+          body,
+          context,
+        };
+      });
+      closeDb();
+    }
+
+    outputResults(enriched, query, { ...opts, limit: filtered.length });
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+type DaemonGetPayload = {
+  file: string;
+  title: string;
+  body: string;
+  context?: string | null;
+  startLine?: number;
+};
+
+async function tryDaemonGetCommand(pathArg: string, fromLine?: number, maxLines?: number, lineNumbers?: boolean): Promise<boolean> {
+  if (!shouldUseDaemon("get")) return false;
+  if (!isDaemonRunning()) return false;
+
+  try {
+    const res = await sendToDaemon({
+      cmd: "get",
+      args: {
+        path: pathArg,
+        fromLine,
+        maxLines,
+        dbPath: getDbPath(),
+        cwd: getPwd(),
+      },
+    });
+
+    if (!res.ok) {
+      console.error(res.error);
+      process.exit(1);
+    }
+
+    const payload = res.result as DaemonGetPayload;
+    if (!payload || typeof payload !== "object" || typeof payload.body !== "string") {
+      return false;
+    }
+
+    outputGetDocument({
+      body: payload.body,
+      context: payload.context ?? null,
+      startLine: payload.startLine,
+    }, lineNumbers);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+type DaemonMultiGetPayload = {
+  results: MultiGetResultItem[];
+  errors?: string[];
+};
+
+async function tryDaemonMultiGet(pattern: string, maxLines: number | undefined, maxBytes: number, format: OutputFormat): Promise<boolean> {
+  if (!shouldUseDaemon("multi-get")) return false;
+  if (!isDaemonRunning()) return false;
+
+  try {
+    const res = await sendToDaemon({
+      cmd: "multi-get",
+      args: {
+        pattern,
+        maxLines,
+        maxBytes,
+        dbPath: getDbPath(),
+      },
+    });
+
+    if (!res.ok) {
+      console.error(res.error);
+      process.exit(1);
+    }
+
+    const payload = res.result as DaemonMultiGetPayload;
+    if (!payload || typeof payload !== "object" || !Array.isArray(payload.results)) {
+      return false;
+    }
+
+    if (payload.errors) {
+      for (const err of payload.errors) {
+        console.error(err);
+      }
+    }
+
+    outputMultiGetResults(payload.results, format);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function tryDaemonLs(pathArg?: string): Promise<boolean> {
+  if (!shouldUseDaemon("ls")) return false;
+  if (!isDaemonRunning()) return false;
+
+  try {
+    const res = await sendToDaemon({
+      cmd: "ls",
+      args: {
+        path: pathArg,
+        dbPath: getDbPath(),
+      },
+    });
+
+    if (!res.ok) {
+      console.error(res.error);
+      if (res.error.startsWith("Collection not found:")) {
+        console.error("Run 'qmd ls' to see available collections.");
+      }
+      process.exit(1);
+    }
+
+    const payload = res.result as LsResult;
+    if (!payload || typeof payload !== "object" || (payload as any).mode === undefined) {
+      return false;
+    }
+
+    outputLsResult(payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function tryDaemonStatus(): Promise<boolean> {
+  if (!shouldUseDaemon("status")) return false;
+  if (!isDaemonRunning()) return false;
+
+  try {
+    const res = await sendToDaemon({
+      cmd: "status",
+      args: {
+        dbPath: getDbPath(),
+      },
+    });
+
+    if (!res.ok) {
+      console.error(res.error);
+      process.exit(1);
+    }
+
+    const payload = res.result as StatusPayload;
+    if (!payload || typeof payload !== "object" || !Array.isArray(payload.collections)) {
+      return false;
+    }
+
+    outputStatus(payload, getDbPath());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function tryDaemonCollectionList(): Promise<boolean> {
+  if (!isDaemonRunning()) return false;
+
+  try {
+    const res = await sendToDaemon({
+      cmd: "status",
+      args: {
+        dbPath: getDbPath(),
+      },
+    });
+
+    if (!res.ok) {
+      return false;
+    }
+
+    const payload = res.result as StatusPayload;
+    if (!payload || typeof payload !== "object" || !Array.isArray(payload.collections)) {
+      return false;
+    }
+
+    outputCollectionList(payload.collections.map(col => ({
+      name: col.name,
+      pattern: col.pattern,
+      fileCount: col.fileCount,
+      lastModified: col.lastModified,
+    })));
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -2340,6 +2746,7 @@ function parseCLI() {
     all: isAll,
     collection: values.collection as string | undefined,
     lineNumbers: !!values["line-numbers"],
+    context: values.context as string | undefined,
   };
 
   return {
@@ -2371,6 +2778,11 @@ function showHelp(): void {
   console.log("  qmd vsearch <query>           - Vector similarity search");
   console.log("  qmd query <query>             - Combined search with query expansion + reranking");
   console.log("  qmd mcp                       - Start MCP server (for AI agent integration)");
+  console.log("  qmd daemon [run]              - Start QMD daemon in foreground");
+  console.log("  qmd daemon status             - Show daemon status");
+  console.log("  qmd daemon stop               - Stop daemon");
+  console.log("  qmd daemon ping               - Ping daemon");
+  console.log("  qmd daemon cleanup            - Remove stale daemon socket/PID files");
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use custom index name (default: index)");
@@ -2404,6 +2816,7 @@ function showHelp(): void {
 // Main CLI - only run if this is the main module
 if (import.meta.main) {
   const cli = parseCLI();
+  let keepAlive = false;
 
   if (!cli.command || cli.values.help) {
     showHelp();
@@ -2501,7 +2914,9 @@ if (import.meta.main) {
       }
       const fromLine = cli.values.from ? parseInt(cli.values.from as string, 10) : undefined;
       const maxLines = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
-      getDocument(cli.args[0], fromLine, maxLines, cli.opts.lineNumbers);
+      if (!(await tryDaemonGetCommand(cli.args[0], fromLine, maxLines, cli.opts.lineNumbers))) {
+        getDocument(cli.args[0], fromLine, maxLines, cli.opts.lineNumbers);
+      }
       break;
     }
 
@@ -2513,12 +2928,16 @@ if (import.meta.main) {
       }
       const maxLinesMulti = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
       const maxBytes = cli.values["max-bytes"] ? parseInt(cli.values["max-bytes"] as string, 10) : DEFAULT_MULTI_GET_MAX_BYTES;
-      multiGet(cli.args[0], maxLinesMulti, maxBytes, cli.opts.format);
+      if (!(await tryDaemonMultiGet(cli.args[0], maxLinesMulti, maxBytes, cli.opts.format))) {
+        multiGet(cli.args[0], maxLinesMulti, maxBytes, cli.opts.format);
+      }
       break;
     }
 
     case "ls": {
-      listFiles(cli.args[0]);
+      if (!(await tryDaemonLs(cli.args[0]))) {
+        listFiles(cli.args[0]);
+      }
       break;
     }
 
@@ -2526,7 +2945,9 @@ if (import.meta.main) {
       const subcommand = cli.args[0];
       switch (subcommand) {
         case "list": {
-          collectionList();
+          if (!(await tryDaemonCollectionList())) {
+            collectionList();
+          }
           break;
         }
 
@@ -2571,7 +2992,9 @@ if (import.meta.main) {
     }
 
     case "status":
-      showStatus();
+      if (!(await tryDaemonStatus())) {
+        showStatus();
+      }
       break;
 
     case "update":
@@ -2587,7 +3010,9 @@ if (import.meta.main) {
         console.error("Usage: qmd search [options] <query>");
         process.exit(1);
       }
-      search(cli.query, cli.opts);
+      if (!(await tryDaemonSearchCommand("search", cli.query, cli.opts))) {
+        search(cli.query, cli.opts);
+      }
       break;
 
     case "vsearch":
@@ -2599,7 +3024,9 @@ if (import.meta.main) {
       if (!cli.values["min-score"]) {
         cli.opts.minScore = 0.3;
       }
-      await vectorSearch(cli.query, cli.opts);
+      if (!(await tryDaemonSearchCommand("vsearch", cli.query, cli.opts))) {
+        await vectorSearch(cli.query, cli.opts);
+      }
       break;
 
     case "query":
@@ -2607,12 +3034,82 @@ if (import.meta.main) {
         console.error("Usage: qmd query [options] <query>");
         process.exit(1);
       }
-      await querySearch(cli.query, cli.opts);
+      if (!(await tryDaemonSearchCommand("query", cli.query, cli.opts))) {
+        await querySearch(cli.query, cli.opts);
+      }
       break;
 
     case "mcp": {
       const { startMcpServer } = await import("./mcp.js");
       await startMcpServer();
+      break;
+    }
+
+    case "daemon": {
+      const subcommand = cli.args[0];
+      switch (subcommand) {
+        case undefined:
+        case "status": {
+          const status = await getDaemonStatus();
+          if (!status.running) {
+            console.log("Daemon is not running.");
+            console.log("Start with: qmd daemon run");
+            break;
+          }
+          console.log(`Daemon running (PID ${status.pid})`);
+          console.log(`Uptime: ${status.uptime}s`);
+          console.log(`Active connections: ${status.activeConnections}`);
+          if (status.loadedModels.length > 0) {
+            console.log(`Loaded models: ${status.loadedModels.join(", ")}`);
+          } else {
+            console.log("Loaded models: (none)");
+          }
+          break;
+        }
+
+        case "run":
+        case "start": {
+          runDaemonForeground();
+          keepAlive = true;
+          break;
+        }
+
+        case "stop": {
+          const res = stopDaemon();
+          if (res.stopped) {
+            console.log("Daemon stopped.");
+          } else {
+            console.error(`Failed to stop daemon: ${res.reason || "unknown error"}`);
+            process.exit(1);
+          }
+          break;
+        }
+
+        case "ping": {
+          if (!isDaemonRunning()) {
+            console.error("Daemon is not running.");
+            process.exit(1);
+          }
+          const res = await sendToDaemon({ cmd: "ping", args: {} });
+          if (!res.ok) {
+            console.error(`Ping failed: ${res.error}`);
+            process.exit(1);
+          }
+          const payload = res.result as { pong?: boolean; pid?: number };
+          console.log(`pong=${payload?.pong ? "true" : "false"} pid=${payload?.pid ?? "unknown"}`);
+          break;
+        }
+
+        case "cleanup": {
+          cleanupStaleFiles();
+          console.log("Cleaned up daemon socket and PID files (if present).");
+          break;
+        }
+
+        default:
+          console.error("Usage: qmd daemon [run|status|stop|ping|cleanup]");
+          process.exit(1);
+      }
       break;
     }
 
@@ -2651,7 +3148,7 @@ if (import.meta.main) {
       process.exit(1);
   }
 
-  if (cli.command !== "mcp") {
+  if (!keepAlive && cli.command !== "mcp") {
     await disposeDefaultLlamaCpp();
     process.exit(0);
   }
