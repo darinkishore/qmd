@@ -2243,7 +2243,7 @@ async function tryDaemonLs(pathArg?: string): Promise<boolean> {
     }
 
     const payload = res.result as LsResult;
-    if (!payload || typeof payload !== "object" || (payload as any).mode === undefined) {
+    if (!payload || typeof payload !== "object" || !("mode" in payload)) {
       return false;
     }
 

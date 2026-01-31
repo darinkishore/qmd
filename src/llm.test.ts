@@ -181,16 +181,20 @@ describe("LlamaCpp Integration", () => {
       
       const freshLlm = new LlamaCpp({});
       let contextCreateCount = 0;
-      
+
+      type EmbedModel = { createEmbeddingContext: (...args: unknown[]) => Promise<unknown> };
+      type EmbedModelAccessor = { ensureEmbedModel: () => Promise<EmbedModel> };
+
       // Instrument the model's createEmbeddingContext to count calls
-      const originalEnsureEmbedModel = (freshLlm as any).ensureEmbedModel.bind(freshLlm);
+      const embedAccessor = freshLlm as unknown as EmbedModelAccessor;
+      const originalEnsureEmbedModel = embedAccessor.ensureEmbedModel.bind(freshLlm);
       let modelInstrumented = false;
-      (freshLlm as any).ensureEmbedModel = async function() {
+      embedAccessor.ensureEmbedModel = async function() {
         const model = await originalEnsureEmbedModel();
         if (!modelInstrumented) {
           modelInstrumented = true;
           const originalCreate = model.createEmbeddingContext.bind(model);
-          model.createEmbeddingContext = async function(...args: any[]) {
+          model.createEmbeddingContext = async function(...args: unknown[]) {
             contextCreateCount++;
             return originalCreate(...args);
           };
@@ -381,4 +385,3 @@ describe("LlamaCpp Integration", () => {
     });
   });
 });
-

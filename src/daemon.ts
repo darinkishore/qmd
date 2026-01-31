@@ -193,9 +193,7 @@ function formatParseError(prefix: string, message: string, line: string): string
 }
 
 function createErrorWithCause(message: string, cause: unknown): Error {
-  const error = new Error(message);
-  (error as Error & { cause?: unknown }).cause = cause;
-  return error;
+  return new Error(message, { cause });
 }
 
 function createLogColors(useColor: boolean): LogBuffer["c"] {
@@ -551,6 +549,80 @@ type DocBodyRow = {
   title: string;
 };
 
+type FileCountRow = { file_count: number };
+type LsFileRow = { path: string; title: string; modified_at: string; size: number };
+type CountRow = { count: number };
+type LatestRow = { latest: string | null };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function readDbRow<T>(row: unknown, guard: (value: unknown) => value is T, label: string): T | null {
+  if (row === null || row === undefined) return null;
+  if (guard(row)) return row;
+  throw new Error(`Unexpected ${label} row shape.`);
+}
+
+function readDbRows<T>(rows: unknown[], guard: (value: unknown) => value is T, label: string): T[] {
+  const result: T[] = [];
+  for (const row of rows) {
+    if (!guard(row)) {
+      throw new Error(`Unexpected ${label} row shape.`);
+    }
+    result.push(row);
+  }
+  return result;
+}
+
+function isDocRow(value: unknown): value is DocRow {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.collectionName === "string" &&
+    typeof value.path === "string" &&
+    typeof value.body === "string" &&
+    typeof value.title === "string" &&
+    typeof value.hash === "string"
+  );
+}
+
+function isDocMetaRow(value: unknown): value is DocMetaRow {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.virtual_path === "string" &&
+    typeof value.body_length === "number" &&
+    typeof value.collection === "string" &&
+    typeof value.path === "string"
+  );
+}
+
+function isDocBodyRow(value: unknown): value is DocBodyRow {
+  if (!isRecord(value)) return false;
+  return typeof value.body === "string" && typeof value.title === "string";
+}
+
+function isFileCountRow(value: unknown): value is FileCountRow {
+  return isRecord(value) && typeof value.file_count === "number";
+}
+
+function isLsFileRow(value: unknown): value is LsFileRow {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.path === "string" &&
+    typeof value.title === "string" &&
+    typeof value.modified_at === "string" &&
+    typeof value.size === "number"
+  );
+}
+
+function isCountRow(value: unknown): value is CountRow {
+  return isRecord(value) && typeof value.count === "number";
+}
+
+function isLatestRow(value: unknown): value is LatestRow {
+  return isRecord(value) && (typeof value.latest === "string" || value.latest === null);
+}
+
 const DOC_SELECT_SQL = `
   SELECT d.collection as collectionName, d.path, content.doc as body, d.title, d.hash
   FROM documents d
@@ -589,19 +661,20 @@ const DOC_BODY_SQL = `
 `;
 
 function getDocByCollectionPath(db: Database, collectionName: string, path: string): DocRow | null {
-  return db.prepare(DOC_SELECT_SQL).get(collectionName, path) as DocRow | null;
+  const row = db.prepare(DOC_SELECT_SQL).get(collectionName, path);
+  return readDbRow(row, isDocRow, "document");
 }
 
-function getDocMetaByCollectionPath(db: Database, collectionName: string, path: string): DocMetaRow | null {
-  return db.prepare(DOC_META_BY_COLLECTION_SQL).get(collectionName, path) as DocMetaRow | null;
-}
-
-function getDocMetaByPath(db: Database, path: string): DocMetaRow | null {
-  return db.prepare(DOC_META_BY_PATH_SQL).get(path) as DocMetaRow | null;
+function getDocMeta(db: Database, path: string, collectionName?: string): DocMetaRow | null {
+  const row = collectionName
+    ? db.prepare(DOC_META_BY_COLLECTION_SQL).get(collectionName, path)
+    : db.prepare(DOC_META_BY_PATH_SQL).get(path);
+  return readDbRow(row, isDocMetaRow, "document metadata");
 }
 
 function getDocBody(db: Database, collectionName: string, path: string): DocBodyRow | null {
-  return db.prepare(DOC_BODY_SQL).get(collectionName, path) as DocBodyRow | null;
+  const row = db.prepare(DOC_BODY_SQL).get(collectionName, path);
+  return readDbRow(row, isDocBodyRow, "document body");
 }
 
 function parsePathWithLineSuffix(path: string, fromLine?: number): { path: string; fromLine?: number } {
@@ -714,6 +787,81 @@ function parseMultiGetPattern(pattern: string): { kind: "list"; items: string[] 
   return { kind: "list", items };
 }
 
+type MultiGetTarget = {
+  filepath: string;
+  displayPath: string;
+  bodyLength: number;
+  collection?: string;
+  path?: string;
+};
+
+function fallbackTitle(displayPath: string, title?: string): string {
+  if (title && title.trim().length > 0) return title;
+  return displayPath.split("/").pop() || displayPath;
+}
+
+function resolveMultiGetTargets(db: Database, patternText: string): { files: MultiGetTarget[]; errors: string[] } {
+  const pattern = parseMultiGetPattern(patternText);
+  const errors: string[] = [];
+
+  if (pattern.kind === "list") {
+    if (pattern.items.length === 0) {
+      throw new Error("No files specified in pattern list. Provide a comma-separated list or a glob pattern.");
+    }
+
+    const files: MultiGetTarget[] = [];
+    for (const name of pattern.items) {
+      let doc: DocMetaRow | null = null;
+      if (isVirtualPath(name)) {
+        const parsed = parseVirtualPath(name);
+        if (!parsed) {
+          errors.push(`Invalid virtual path: ${name}`);
+          continue;
+        }
+        doc = getDocMeta(db, parsed.path, parsed.collectionName);
+      } else {
+        doc = getDocMeta(db, name);
+      }
+
+      if (!doc) {
+        errors.push(`File not found: ${name}`);
+        continue;
+      }
+
+      files.push({
+        filepath: doc.virtual_path,
+        displayPath: doc.virtual_path,
+        bodyLength: doc.body_length,
+        collection: doc.collection,
+        path: doc.path,
+      });
+    }
+
+    return { files, errors };
+  }
+
+  const files = matchFilesByGlob(db, patternText).map((file) => ({
+    ...file,
+    collection: undefined,
+    path: undefined,
+  }));
+
+  if (files.length === 0) {
+    throw new Error(`No files matched pattern: ${patternText}. Try 'qmd ls <collection>' to browse files.`);
+  }
+
+  return { files, errors };
+}
+
+function resolveMultiGetLocation(file: MultiGetTarget): { collection: string; path: string } | null {
+  if (file.collection && file.path) {
+    return { collection: file.collection, path: file.path };
+  }
+  const parsed = parseVirtualPath(file.filepath);
+  if (!parsed) return null;
+  return { collection: parsed.collectionName, path: parsed.path };
+}
+
 type RankedDoc = {
   file: string;
   displayPath: string;
@@ -740,13 +888,6 @@ function hasStrongBm25Signal(results: SearchResult[]): { strong: boolean; topSco
   const secondScore = results[1]?.score ?? 0;
   const strong = results.length > 0 && topScore >= BM25_STRONG_SCORE && (topScore - secondScore) >= BM25_STRONG_GAP;
   return { strong, topScore, secondScore };
-}
-
-function logQueryExpansionLines(logger: LogBuffer, query: string, includeLexical: boolean, queryables: Queryable[]): void {
-  const lines = formatQueryExpansionLines(query, includeLexical, queryables, logger.c);
-  for (const line of lines) {
-    logger.write(line + "\n");
-  }
 }
 
 function buildRrfWeights(count: number): number[] {
@@ -786,6 +927,141 @@ function pickBestChunkIndex(chunks: { text: string; pos: number }[], queryTerms:
     }
   }
   return bestIdx;
+}
+
+type RerankBlend = {
+  file: string;
+  displayPath: string;
+  title: string;
+  body: string;
+  chunkPos: number;
+  score: number;
+  hash: string;
+};
+
+function buildQueryTerms(query: string): string[] {
+  return query
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((term) => term.length >= MIN_QUERY_TERM_LENGTH);
+}
+
+async function buildQueryPlan(
+  args: SearchArgs,
+  initialFts: SearchResult[],
+  logger: LogBuffer
+): Promise<{ ftsQueries: string[]; vectorQueries: string[] }> {
+  const { strong, topScore } = hasStrongBm25Signal(initialFts);
+  const ftsQueries = [args.query];
+  const vectorQueries = [args.query];
+
+  if (strong) {
+    logger.write(`${logger.c.dim}Strong BM25 signal (${topScore.toFixed(2)}) - skipping expansion${logger.c.reset}\n`);
+    const lines = formatQueryExpansionLines(args.query, true, [], logger.c);
+    for (const line of lines) {
+      logger.write(line + "\n");
+    }
+    return { ftsQueries, vectorQueries };
+  }
+
+  const queryables = await expandQueryStructuredWithLogs(args.query, true, args.context, logger);
+  for (const q of queryables) {
+    if (!q.text || q.text === args.query) continue;
+    if (q.type === "lex") {
+      ftsQueries.push(q.text);
+    } else if (q.type === "vec" || q.type === "hyde") {
+      vectorQueries.push(q.text);
+    }
+  }
+
+  return { ftsQueries, vectorQueries };
+}
+
+async function runHybridSearches(
+  db: Database,
+  ftsQueries: string[],
+  vectorQueries: string[],
+  collectionName: string,
+  hasVectors: boolean,
+  hashMap: Map<string, string>
+): Promise<RankedDoc[][]> {
+  const ftsLists = ftsQueries
+    .map((q) => searchFTS(db, q, QUERY_FTS_LIMIT, collectionName))
+    .filter((results) => results.length > 0)
+    .map((results) => toRankedDocs(results, hashMap));
+
+  if (!hasVectors) return ftsLists;
+
+  const vecResults = await Promise.all(
+    vectorQueries.map((q) => searchVec(db, q, DEFAULT_EMBED_MODEL, QUERY_VEC_LIMIT, collectionName))
+  );
+
+  const vecLists = vecResults
+    .filter((results) => results.length > 0)
+    .map((results) => toRankedDocs(results, hashMap));
+
+  return [...ftsLists, ...vecLists];
+}
+
+function fuseCandidates(rankedLists: RankedDoc[][]): RankedDoc[] {
+  if (rankedLists.length === 0) return [];
+  return reciprocalRankFusion(rankedLists, buildRrfWeights(rankedLists.length)).slice(0, QUERY_RERANK_LIMIT);
+}
+
+function selectRerankChunks(
+  candidates: RankedDoc[],
+  queryTerms: string[]
+): { rerankDocs: { file: string; text: string }[]; docChunkMap: Map<string, ChunkSelection> } {
+  const rerankDocs: { file: string; text: string }[] = [];
+  const docChunkMap = new Map<string, ChunkSelection>();
+
+  for (const candidate of candidates) {
+    const chunks = chunkDocument(candidate.body);
+    if (chunks.length === 0) continue;
+    const bestIdx = pickBestChunkIndex(chunks, queryTerms);
+    rerankDocs.push({ file: candidate.file, text: chunks[bestIdx]!.text });
+    docChunkMap.set(candidate.file, { chunks, bestIdx });
+  }
+
+  return { rerankDocs, docChunkMap };
+}
+
+async function rerankCandidates(
+  query: string,
+  candidates: RankedDoc[],
+  hashMap: Map<string, string>,
+  logger: LogBuffer
+): Promise<RerankBlend[]> {
+  if (candidates.length === 0) return [];
+
+  const queryTerms = buildQueryTerms(query);
+  const { rerankDocs, docChunkMap } = selectRerankChunks(candidates, queryTerms);
+  if (rerankDocs.length === 0) return [];
+
+  const reranked = await rerankWithLogs(query, rerankDocs, logger);
+  if (reranked.length === 0) return [];
+
+  const candidateMap = new Map(candidates.map((c) => [c.file, c]));
+  const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
+
+  return reranked
+    .map((r) => {
+      const candidate = candidateMap.get(r.file);
+      if (!candidate) return null;
+      const rrfRank = rrfRankMap.get(r.file) ?? RRF_DEFAULT_RANK;
+      const chunkInfo = docChunkMap.get(r.file);
+      const chunk = chunkInfo?.chunks[chunkInfo.bestIdx] ?? { text: candidate.body, pos: 0 };
+      return {
+        file: r.file,
+        displayPath: candidate.displayPath,
+        title: candidate.title,
+        body: chunk.text,
+        chunkPos: chunk.pos,
+        score: blendRrfAndRerank(rrfRank, r.score),
+        hash: hashMap.get(r.file) ?? "",
+      };
+    })
+    .filter((entry): entry is RerankBlend => entry !== null);
 }
 
 // =============================================================================
@@ -864,114 +1140,25 @@ async function handleQuery(args: SearchArgs): Promise<DaemonSearchResponse> {
 
   const initialFts = searchFTS(db, args.query, QUERY_FTS_LIMIT, collectionName);
   const hasVectors = hasVectorIndex(db);
-  const { strong, topScore } = hasStrongBm25Signal(initialFts);
+  const { ftsQueries, vectorQueries } = await buildQueryPlan(args, initialFts, logger);
 
-  const ftsQueries = [args.query];
-  const vectorQueries = [args.query];
+  const vectorCount = hasVectors ? vectorQueries.length : 0;
+  logger.write(`${logger.c.dim}Searching ${ftsQueries.length} lexical + ${vectorCount} vector queries...${logger.c.reset}\n`);
 
-  if (strong) {
-    logger.write(`${logger.c.dim}Strong BM25 signal (${topScore.toFixed(2)}) - skipping expansion${logger.c.reset}\n`);
-    logQueryExpansionLines(logger, args.query, true, []);
-  } else {
-    const queryables = await expandQueryStructuredWithLogs(args.query, true, args.context, logger);
-    for (const q of queryables) {
-      if (!q.text || q.text === args.query) continue;
-      if (q.type === "lex") {
-        ftsQueries.push(q.text);
-      } else if (q.type === "vec" || q.type === "hyde") {
-        vectorQueries.push(q.text);
-      }
-    }
-  }
-
-  logger.write(`${logger.c.dim}Searching ${ftsQueries.length} lexical + ${vectorQueries.length} vector queries...${logger.c.reset}\n`);
-
-  const rankedLists: RankedDoc[][] = [];
   const hashMap = new Map<string, string>();
-  const searches: Promise<void>[] = [];
+  const rankedLists = await runHybridSearches(db, ftsQueries, vectorQueries, collectionName, hasVectors, hashMap);
 
-  for (const q of ftsQueries) {
-    searches.push((async () => {
-      const ftsResults = searchFTS(db, q, QUERY_FTS_LIMIT, collectionName);
-      if (ftsResults.length > 0) {
-        rankedLists.push(toRankedDocs(ftsResults, hashMap));
-      }
-    })());
-  }
-
-  if (hasVectors) {
-    for (const q of vectorQueries) {
-      searches.push((async () => {
-        const vecResults = await searchVec(db, q, DEFAULT_EMBED_MODEL, QUERY_VEC_LIMIT, collectionName);
-        if (vecResults.length > 0) {
-          rankedLists.push(toRankedDocs(vecResults, hashMap));
-        }
-      })());
-    }
-  }
-
-  await Promise.all(searches);
-
-  if (rankedLists.length === 0) {
-    return { results: [], stderr: logger.stderr };
-  }
-
-  const fused = reciprocalRankFusion(rankedLists, buildRrfWeights(rankedLists.length));
-  const candidates = fused.slice(0, QUERY_RERANK_LIMIT);
+  const candidates = fuseCandidates(rankedLists);
   if (candidates.length === 0) {
     return { results: [], stderr: logger.stderr };
   }
 
-  const queryTerms = args.query
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((term) => term.length >= MIN_QUERY_TERM_LENGTH);
-
-  const chunksToRerank: { file: string; text: string }[] = [];
-  const docChunkMap = new Map<string, ChunkSelection>();
-
-  for (const candidate of candidates) {
-    const chunks = chunkDocument(candidate.body);
-    if (chunks.length === 0) continue;
-    const bestIdx = pickBestChunkIndex(chunks, queryTerms);
-    chunksToRerank.push({ file: candidate.file, text: chunks[bestIdx]!.text });
-    docChunkMap.set(candidate.file, { chunks, bestIdx });
-  }
-
-  const reranked = await rerankWithLogs(
-    args.query,
-    chunksToRerank.map((c) => ({ file: c.file, text: c.text })),
-    logger
-  );
-
+  const reranked = await rerankCandidates(args.query, candidates, hashMap, logger);
   if (reranked.length === 0) {
     return { results: [], stderr: logger.stderr };
   }
 
-  const candidateMap = new Map(candidates.map((c) => [c.file, c]));
-  const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
-
-  const scored = new Map<string, number>();
-  for (const r of reranked) {
-    scored.set(r.file, r.score);
-  }
-
-  const blendedResults = Array.from(scored.entries())
-    .map(([file, rerankScore]) => {
-      const candidate = candidateMap.get(file);
-      const rrfRank = rrfRankMap.get(file) ?? RRF_DEFAULT_RANK;
-      const chunkInfo = docChunkMap.get(file);
-      const chunk = chunkInfo?.chunks[chunkInfo.bestIdx] ?? { text: candidate?.body ?? "", pos: 0 };
-      return {
-        file,
-        displayPath: candidate?.displayPath ?? "",
-        title: candidate?.title ?? "",
-        body: chunk.text,
-        chunkPos: chunk.pos,
-        score: blendRrfAndRerank(rrfRank, rerankScore),
-        hash: hashMap.get(file) ?? "",
-      };
-    })
+  const blendedResults = reranked
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
 
@@ -1026,84 +1213,29 @@ async function handleGet(args: GetArgs): Promise<DaemonGetResponse> {
 async function handleMultiGet(args: MultiGetArgs): Promise<DaemonMultiGetResponse> {
   const db = getDb(args.dbPath);
   const maxBytes = args.maxBytes ?? DEFAULT_MULTI_GET_MAX_BYTES;
-  const pattern = parseMultiGetPattern(args.pattern);
-
-  let files: { filepath: string; displayPath: string; bodyLength: number; collection?: string; path?: string }[] = [];
-  const errors: string[] = [];
-
-  if (pattern.kind === "list") {
-    if (pattern.items.length === 0) {
-      throw new Error("No files specified in pattern list. Provide a comma-separated list or a glob pattern.");
-    }
-
-    for (const name of pattern.items) {
-      let doc: DocMetaRow | null = null;
-      if (isVirtualPath(name)) {
-        const parsed = parseVirtualPath(name);
-        if (!parsed) {
-          errors.push(`Invalid virtual path: ${name}`);
-          continue;
-        }
-        doc = getDocMetaByCollectionPath(db, parsed.collectionName, parsed.path);
-      } else {
-        doc = getDocMetaByPath(db, name);
-      }
-
-      if (!doc) {
-        errors.push(`File not found: ${name}`);
-        continue;
-      }
-
-      files.push({
-        filepath: doc.virtual_path,
-        displayPath: doc.virtual_path,
-        bodyLength: doc.body_length,
-        collection: doc.collection,
-        path: doc.path,
-      });
-    }
-  } else {
-    files = matchFilesByGlob(db, args.pattern).map((file) => ({
-      ...file,
-      collection: undefined,
-      path: undefined,
-    }));
-    if (files.length === 0) {
-      throw new Error(`No files matched pattern: ${args.pattern}. Try 'qmd ls <collection>' to browse files.`);
-    }
-  }
+  const { files, errors } = resolveMultiGetTargets(db, args.pattern);
 
   const results: DaemonMultiGetResponse["results"] = [];
 
   for (const file of files) {
-    let collection = file.collection;
-    let path = file.path;
-
-    if (!collection || !path) {
-      const parsed = parseVirtualPath(file.filepath);
-      if (parsed) {
-        collection = parsed.collectionName;
-        path = parsed.path;
-      }
-    }
-
-    const context = collection && path ? getContextForPath(db, collection, path) : null;
+    const location = resolveMultiGetLocation(file);
+    const context = location ? getContextForPath(db, location.collection, location.path) : null;
 
     if (file.bodyLength > maxBytes) {
       results.push({
         file: file.filepath,
         displayPath: file.displayPath,
-        title: file.displayPath.split("/").pop() || file.displayPath,
+        title: fallbackTitle(file.displayPath),
         body: "",
         context,
         skipped: true,
-        skipReason: `File too large (${Math.round(file.bodyLength / 1024)}KB > ${Math.round(maxBytes / 1024)}KB). Use 'qmd get ${file.displayPath}' to retrieve.`,
+        skipReason: `File too large (${Math.round(file.bodyLength / 1024)}KB > ${Math.round(maxBytes / 1024)}KB). Use 'qmd get ${file.filepath}' to retrieve.`,
       });
       continue;
     }
 
-    if (!collection || !path) continue;
-    const doc = getDocBody(db, collection, path);
+    if (!location) continue;
+    const doc = getDocBody(db, location.collection, location.path);
     if (!doc) continue;
 
     const body = args.maxLines !== undefined ? truncateBodyByLines(doc.body, args.maxLines) : doc.body;
@@ -1111,7 +1243,7 @@ async function handleMultiGet(args: MultiGetArgs): Promise<DaemonMultiGetRespons
     results.push({
       file: file.filepath,
       displayPath: file.displayPath,
-      title: doc.title || file.displayPath.split("/").pop() || file.displayPath,
+      title: fallbackTitle(file.displayPath, doc.title),
       body,
       context,
       skipped: false,
@@ -1134,15 +1266,16 @@ async function handleLs(args: LsArgs): Promise<DaemonLsResponse> {
     }
 
     const collections = yamlCollections.map(coll => {
-      const stats = db.prepare(`
+      const statsRow = db.prepare(`
         SELECT COUNT(*) as file_count
         FROM documents d
         WHERE d.collection = ? AND d.active = 1
-      `).get(coll.name) as { file_count: number } | null;
+      `).get(coll.name);
+      const stats = readDbRow(statsRow, isFileCountRow, "collection file count");
 
       return {
         name: coll.name,
-        fileCount: stats?.file_count || 0,
+        fileCount: stats?.file_count ?? 0,
       };
     });
 
@@ -1165,12 +1298,8 @@ async function handleLs(args: LsArgs): Promise<DaemonLsResponse> {
 
   if (pathPrefix) params.push(`${pathPrefix}%`);
 
-  const files = db.prepare(query).all(...params) as {
-    path: string;
-    title: string;
-    modified_at: string;
-    size: number;
-  }[];
+  const rows = db.prepare(query).all(...params) as unknown[];
+  const files = readDbRows(rows, isLsFileRow, "ls file");
 
   return {
     mode: "files",
@@ -1192,10 +1321,13 @@ async function handleStatus(args: { dbPath?: string }): Promise<DaemonIndexStatu
   const db = getDb(args.dbPath);
 
   const collections = listCollections(db);
-  const totalDocs = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
-  const vectorCount = db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number };
+  const totalDocsRow = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get();
+  const vectorCountRow = db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get();
   const needsEmbedding = getHashesNeedingEmbedding(db);
-  const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
+  const mostRecentRow = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get();
+  const totalDocs = readDbRow(totalDocsRow, isCountRow, "document count");
+  const vectorCount = readDbRow(vectorCountRow, isCountRow, "vector count");
+  const mostRecent = readDbRow(mostRecentRow, isLatestRow, "latest modified");
   const contexts = listAllContexts();
 
   return {
@@ -1205,10 +1337,10 @@ async function handleStatus(args: { dbPath?: string }): Promise<DaemonIndexStatu
       fileCount: c.active_count,
       lastModified: c.last_modified,
     })),
-    totalDocs: totalDocs.count,
-    vectorCount: vectorCount.count,
+    totalDocs: totalDocs?.count ?? 0,
+    vectorCount: vectorCount?.count ?? 0,
     needsEmbedding,
-    mostRecent: mostRecent.latest,
+    mostRecent: mostRecent?.latest ?? null,
     contexts,
   };
 }
@@ -1291,6 +1423,23 @@ async function handleCommand(req: DaemonRequestGeneric): Promise<DaemonResponse>
 // Socket Server
 // =============================================================================
 
+async function handleRequestLine(socket: { write: (text: string) => void }, line: string): Promise<void> {
+  if (!line.trim()) return;
+
+  try {
+    const parsed = JSON.parse(line) as unknown;
+    if (!isDaemonRequestGeneric(parsed)) {
+      throw new Error("Invalid request: expected { cmd, args } with a supported command.");
+    }
+    const res = await handleCommand(parsed);
+    socket.write(JSON.stringify(res) + '\n');
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const res: DaemonResponse = { ok: false, error: formatParseError("Parse error", message, line) };
+    socket.write(JSON.stringify(res) + '\n');
+  }
+}
+
 function startServer(): void {
   registerSignalHandlers();
 
@@ -1338,20 +1487,7 @@ function startServer(): void {
         socket.data.buffer = lines.pop() || ""; // Keep incomplete line
 
         for (const line of lines) {
-          if (!line.trim()) continue;
-
-          try {
-            const parsed = JSON.parse(line) as unknown;
-            if (!isDaemonRequestGeneric(parsed)) {
-              throw new Error("Invalid request: expected { cmd, args } with a supported command.");
-            }
-            const res = await handleCommand(parsed);
-            socket.write(JSON.stringify(res) + '\n');
-          } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            const res: DaemonResponse = { ok: false, error: formatParseError("Parse error", message, line) };
-            socket.write(JSON.stringify(res) + '\n');
-          }
+          await handleRequestLine(socket, line);
         }
       },
 
@@ -1462,15 +1598,28 @@ export async function sendToDaemon(req: DaemonRequest, timeoutMs = 30000): Promi
   return new Promise((resolve, reject) => {
     let buffer = "";
     let resolved = false;
+    let client: { end: () => void } | null = null;
 
-    const cleanup = () => {
+    const closeClient = () => {
+      if (!client) return;
+      try {
+        client.end();
+      } catch {
+        // best-effort close
+      }
+      client = null;
+    };
+
+    const finalize = (closeSocket: boolean) => {
+      if (resolved) return;
       resolved = true;
       clearTimeout(timeout);
+      if (closeSocket) closeClient();
     };
 
     const timeout = setTimeout(() => {
       if (!resolved) {
-        cleanup();
+        finalize(true);
         reject(new Error(`Daemon request timed out after ${timeoutMs}ms for '${req.cmd}'.`));
       }
     }, timeoutMs);
@@ -1479,6 +1628,7 @@ export async function sendToDaemon(req: DaemonRequest, timeoutMs = 30000): Promi
       unix: SOCKET_PATH,
       socket: {
         open(socket) {
+          client = socket;
           socket.write(JSON.stringify(req) + '\n');
         },
         data(socket, data) {
@@ -1492,12 +1642,10 @@ export async function sendToDaemon(req: DaemonRequest, timeoutMs = 30000): Promi
           const line = buffer.slice(0, newlineIdx);
           try {
             const res = JSON.parse(line) as DaemonResponse;
-            cleanup();
-            socket.end();
+            finalize(true);
             resolve(res);
           } catch (err) {
-            cleanup();
-            socket.end();
+            finalize(true);
             const message = err instanceof Error ? err.message : String(err);
             const wrapped = createErrorWithCause(
               formatParseError(`Failed to parse daemon response for '${req.cmd}'`, message, line),
@@ -1508,19 +1656,19 @@ export async function sendToDaemon(req: DaemonRequest, timeoutMs = 30000): Promi
         },
         error(socket, error) {
           if (!resolved) {
-            cleanup();
+            finalize(false);
             reject(createErrorWithCause(`Daemon socket error during '${req.cmd}': ${error.message || error}`, error));
           }
         },
         close() {
           if (!resolved) {
-            cleanup();
+            finalize(false);
             reject(new Error(`Connection closed by daemon before response for '${req.cmd}'.`));
           }
         },
         connectError(socket, error) {
           if (!resolved) {
-            cleanup();
+            finalize(false);
             reject(createErrorWithCause(
               `Failed to connect to daemon for '${req.cmd}': ${error.message || error}. Is the daemon running?`,
               error

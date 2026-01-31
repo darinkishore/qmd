@@ -247,12 +247,33 @@ const DAEMON_COMMANDS_LIST = [
 
 export const DAEMON_COMMANDS: ReadonlySet<string> = new Set(DAEMON_COMMANDS_LIST);
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isArgsForCommand(cmd: DaemonCommandName, args: Record<string, unknown>): boolean {
+  switch (cmd) {
+    case "search":
+    case "vsearch":
+    case "query":
+      return typeof args.query === "string";
+    case "get":
+      return typeof args.path === "string";
+    case "multi-get":
+      return typeof args.pattern === "string";
+    case "ls":
+    case "status":
+    case "ping":
+    case "daemon-status":
+      return true;
+  }
+}
+
 export function isDaemonRequestGeneric(value: unknown): value is DaemonRequestGeneric {
-  if (!value || typeof value !== "object") return false;
-  const v = value as Record<string, unknown>;
-  if (typeof v.cmd !== "string" || !DAEMON_COMMANDS.has(v.cmd)) return false;
-  if (typeof v.args !== "object" || v.args === null || Array.isArray(v.args)) return false;
-  return true;
+  if (!isRecord(value)) return false;
+  if (typeof value.cmd !== "string" || !DAEMON_COMMANDS.has(value.cmd)) return false;
+  if (!isRecord(value.args)) return false;
+  return isArgsForCommand(value.cmd as DaemonCommandName, value.args);
 }
 
 /**
