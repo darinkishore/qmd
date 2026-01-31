@@ -2049,6 +2049,7 @@ async function tryDaemonSearchCommand(cmd: "search" | "vsearch" | "query", query
 
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
   try {
+    const includeBody = opts.format !== "files";
     const res = await sendToDaemon({
       cmd,
       args: {
@@ -2056,7 +2057,7 @@ async function tryDaemonSearchCommand(cmd: "search" | "vsearch" | "query", query
         limit: fetchLimit,
         minScore: opts.minScore,
         collection: opts.collection,
-        full: false,
+        full: includeBody,
         dbPath: getDbPath(),
         useColor,
         context: opts.context,

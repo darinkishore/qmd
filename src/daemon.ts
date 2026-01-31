@@ -110,8 +110,13 @@ const RRF_WEIGHTS = [
 const RRF_PRIMARY_WEIGHT = 2;
 const RRF_SECONDARY_WEIGHT = 1;
 
+type LineFramer = {
+  push: (chunk: string) => { lines: string[]; overflow: boolean };
+  getBuffer: () => string;
+};
+
 type DaemonSocketData = {
-  buffer: string;
+  framer: LineFramer;
   cleaned?: boolean; // Track if connection was already cleaned up
 };
 
@@ -463,6 +468,12 @@ export function validateStatusArgs(args: unknown): { dbPath?: string } {
   };
 }
 
+function requireEmptyArgs(args: Record<string, unknown>, cmd: string): void {
+  if (Object.keys(args).length > 0) {
+    throw new Error(`Invalid argument: ${cmd} does not accept any arguments.`);
+  }
+}
+
 function resolveCollectionName(collection?: string): string | undefined {
   if (!collection) return undefined;
   const coll = getCollectionFromYaml(collection);
@@ -494,6 +505,26 @@ function toDaemonSearchResult(result: SearchResult): DaemonSearchResult {
     body: result.body,
     context: result.context,
   };
+}
+
+function applySearchConstraints<T extends { score: number }>(
+  results: T[],
+  limit: number,
+  minScore?: number
+): T[] {
+  const filtered = minScore !== undefined
+    ? results.filter((result) => result.score >= minScore)
+    : results;
+  return filtered.slice(0, limit);
+}
+
+function shouldIncludeBody(full?: boolean): boolean {
+  return full !== false;
+}
+
+function stripBodyIfNeeded(results: DaemonSearchResult[], includeBody: boolean): DaemonSearchResult[] {
+  if (includeBody) return results;
+  return results.map(({ body: _body, ...rest }) => rest);
 }
 
 // =============================================================================
@@ -727,41 +758,56 @@ function parseLsPath(inputPath: string): { collectionName: string; pathPrefix: s
   return { collectionName, pathPrefix };
 }
 
-function resolveDocFromInputPath(
-  db: Database,
-  inputPath: string,
-  cwd?: string
-): { doc: DocRow; virtualPath: string } | null {
-  if (isVirtualPath(inputPath)) {
-    const parsed = parseVirtualPath(inputPath);
-    if (!parsed) {
-      throw new Error(`Invalid virtual path: ${inputPath}. Expected format: qmd://<collection>/<path>.`);
-    }
-    const doc = getDocByCollectionPath(db, parsed.collectionName, parsed.path);
-    if (!doc) return null;
-    return { doc, virtualPath: buildVirtualPath(doc.collectionName, doc.path) };
-  }
+type ResolvedDoc = { doc: DocRow; virtualPath: string };
 
+function resolveDocFromVirtualPath(db: Database, inputPath: string): ResolvedDoc | null {
+  if (!isVirtualPath(inputPath)) return null;
+  const parsed = parseVirtualPath(inputPath);
+  if (!parsed) {
+    throw new Error(`Invalid virtual path: ${inputPath}. Expected format: qmd://<collection>/<path>.`);
+  }
+  const doc = getDocByCollectionPath(db, parsed.collectionName, parsed.path);
+  if (!doc) return null;
+  return { doc, virtualPath: buildVirtualPath(doc.collectionName, doc.path) };
+}
+
+function resolveDocFromCollectionPath(db: Database, inputPath: string): ResolvedDoc | null {
   const collectionPath = parseCollectionPath(inputPath);
-  if (collectionPath) {
-    const doc = getDocByCollectionPath(db, collectionPath.collectionName, collectionPath.path);
-    if (!doc) return null;
-    return { doc, virtualPath: buildVirtualPath(doc.collectionName, doc.path) };
-  }
+  if (!collectionPath) return null;
+  const doc = getDocByCollectionPath(db, collectionPath.collectionName, collectionPath.path);
+  if (!doc) return null;
+  return { doc, virtualPath: buildVirtualPath(doc.collectionName, doc.path) };
+}
 
+function resolveFilesystemPath(inputPath: string, cwd?: string): string {
   let fsPath = inputPath;
   if (fsPath.startsWith("~/")) {
     fsPath = homedir() + fsPath.slice(1);
   } else if (!fsPath.startsWith("/")) {
     fsPath = resolve(cwd || getPwd(), fsPath);
   }
-  fsPath = getRealPath(fsPath);
+  return getRealPath(fsPath);
+}
 
+function resolveDocFromFilesystemPath(db: Database, inputPath: string, cwd?: string): ResolvedDoc | null {
+  const fsPath = resolveFilesystemPath(inputPath, cwd);
   const detected = detectCollectionFromPath(fsPath);
   if (!detected) return null;
   const doc = getDocByCollectionPath(db, detected.collectionName, detected.relativePath);
   if (!doc) return null;
   return { doc, virtualPath: buildVirtualPath(doc.collectionName, doc.path) };
+}
+
+function resolveDocFromInputPath(
+  db: Database,
+  inputPath: string,
+  cwd?: string
+): ResolvedDoc | null {
+  return (
+    resolveDocFromVirtualPath(db, inputPath)
+    ?? resolveDocFromCollectionPath(db, inputPath)
+    ?? resolveDocFromFilesystemPath(db, inputPath, cwd)
+  );
 }
 
 function sliceDocumentBody(body: string, fromLine: number, maxLines?: number): string {
@@ -1064,6 +1110,43 @@ async function rerankCandidates(
     .filter((entry): entry is RerankBlend => entry !== null);
 }
 
+async function runHybridQueryPipeline(
+  args: SearchArgs,
+  db: Database,
+  collectionName: string | undefined,
+  logger: LogBuffer
+): Promise<DaemonSearchResult[]> {
+  const initialFts = searchFTS(db, args.query, QUERY_FTS_LIMIT, collectionName);
+  const hasVectors = hasVectorIndex(db);
+  const { ftsQueries, vectorQueries } = await buildQueryPlan(args, initialFts, logger);
+
+  const vectorCount = hasVectors ? vectorQueries.length : 0;
+  logger.write(`${logger.c.dim}Searching ${ftsQueries.length} lexical + ${vectorCount} vector queries...${logger.c.reset}\n`);
+
+  const hashMap = new Map<string, string>();
+  const rankedLists = await runHybridSearches(db, ftsQueries, vectorQueries, collectionName, hasVectors, hashMap);
+
+  const candidates = fuseCandidates(rankedLists);
+  if (candidates.length === 0) return [];
+
+  const reranked = await rerankCandidates(args.query, candidates, hashMap, logger);
+  if (reranked.length === 0) return [];
+
+  return reranked
+    .sort((a, b) => b.score - a.score)
+    .map((result) => ({
+      file: result.file,
+      displayPath: result.displayPath,
+      title: result.title,
+      score: result.score,
+      hash: result.hash,
+      docid: result.hash ? getDocid(result.hash) : undefined,
+      chunkPos: result.chunkPos,
+      body: result.body,
+      context: getContextForFilePath(db, result.file),
+    }));
+}
+
 // =============================================================================
 // Command Handlers
 // =============================================================================
@@ -1076,7 +1159,9 @@ async function handleSearch(args: SearchArgs): Promise<DaemonSearchResponse> {
   const collectionName = resolveCollectionName(args.collection);
   const db = getDb(args.dbPath);
   const results = searchFTS(db, args.query, limit, collectionName);
-  return { results: results.map(toDaemonSearchResult) };
+  const mapped = results.map(toDaemonSearchResult);
+  const constrained = applySearchConstraints(mapped, limit, args.minScore);
+  return { results: stripBodyIfNeeded(constrained, shouldIncludeBody(args.full)) };
 }
 
 /**
@@ -1117,10 +1202,13 @@ async function handleVsearch(args: SearchArgs): Promise<DaemonSearchResponse> {
 
   const results = Array.from(bestByFile.values())
     .sort((a, b) => b.score - a.score)
-    .slice(0, limit)
     .map(toDaemonSearchResult);
+  const constrained = applySearchConstraints(results, limit, args.minScore);
 
-  return { results, stderr: logger.stderr };
+  return {
+    results: stripBodyIfNeeded(constrained, shouldIncludeBody(args.full)),
+    stderr: logger.stderr,
+  };
 }
 
 /**
@@ -1137,44 +1225,13 @@ async function handleQuery(args: SearchArgs): Promise<DaemonSearchResponse> {
   loadedModels.add("query-expansion");
 
   checkIndexHealthWithLogs(db, logger);
+  const results = await runHybridQueryPipeline(args, db, collectionName, logger);
+  const constrained = applySearchConstraints(results, limit, args.minScore);
 
-  const initialFts = searchFTS(db, args.query, QUERY_FTS_LIMIT, collectionName);
-  const hasVectors = hasVectorIndex(db);
-  const { ftsQueries, vectorQueries } = await buildQueryPlan(args, initialFts, logger);
-
-  const vectorCount = hasVectors ? vectorQueries.length : 0;
-  logger.write(`${logger.c.dim}Searching ${ftsQueries.length} lexical + ${vectorCount} vector queries...${logger.c.reset}\n`);
-
-  const hashMap = new Map<string, string>();
-  const rankedLists = await runHybridSearches(db, ftsQueries, vectorQueries, collectionName, hasVectors, hashMap);
-
-  const candidates = fuseCandidates(rankedLists);
-  if (candidates.length === 0) {
-    return { results: [], stderr: logger.stderr };
-  }
-
-  const reranked = await rerankCandidates(args.query, candidates, hashMap, logger);
-  if (reranked.length === 0) {
-    return { results: [], stderr: logger.stderr };
-  }
-
-  const blendedResults = reranked
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
-
-  const results: DaemonSearchResult[] = blendedResults.map((result) => ({
-    file: result.file,
-    displayPath: result.displayPath,
-    title: result.title,
-    score: result.score,
-    hash: result.hash,
-    docid: result.hash ? getDocid(result.hash) : undefined,
-    chunkPos: result.chunkPos,
-    body: result.body,
-    context: getContextForFilePath(db, result.file),
-  }));
-
-  return { results, stderr: logger.stderr };
+  return {
+    results: stripBodyIfNeeded(constrained, shouldIncludeBody(args.full)),
+    stderr: logger.stderr,
+  };
 }
 
 /**
@@ -1389,9 +1446,11 @@ async function handleCommand(req: DaemonRequestGeneric): Promise<DaemonResponse>
         result = await handleStatus(validateStatusArgs(req.args));
         break;
       case "daemon-status":
+        requireEmptyArgs(req.args, req.cmd);
         result = await handleDaemonStatus();
         break;
       case "ping":
+        requireEmptyArgs(req.args, req.cmd);
         result = { pong: true, pid: process.pid } satisfies DaemonPingResponse;
         break;
       default:
@@ -1422,6 +1481,24 @@ async function handleCommand(req: DaemonRequestGeneric): Promise<DaemonResponse>
 // =============================================================================
 // Socket Server
 // =============================================================================
+
+function createLineFramer(maxBytes: number): LineFramer {
+  let buffer = "";
+  return {
+    push(chunk: string) {
+      buffer += chunk;
+      if (buffer.length > maxBytes) {
+        return { lines: [], overflow: true };
+      }
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || "";
+      return { lines, overflow: false };
+    },
+    getBuffer() {
+      return buffer;
+    },
+  };
+}
 
 async function handleRequestLine(socket: { write: (text: string) => void }, line: string): Promise<void> {
   if (!line.trim()) return;
@@ -1465,14 +1542,13 @@ function startServer(): void {
     unix: SOCKET_PATH,
     socket: {
       open(socket) {
-        socket.data = { buffer: "" };
+        socket.data = { framer: createLineFramer(SOCKET_BUFFER_LIMIT) };
         activeConnections++;
       },
 
       async data(socket, data) {
-        // Accumulate data in buffer
-        socket.data.buffer += data.toString();
-        if (socket.data.buffer.length > SOCKET_BUFFER_LIMIT) {
+        const { lines, overflow } = socket.data.framer.push(data.toString());
+        if (overflow) {
           const res: DaemonResponse = {
             ok: false,
             error: `Request too large (>${SOCKET_BUFFER_LIMIT} bytes).`,
@@ -1481,10 +1557,6 @@ function startServer(): void {
           socket.end();
           return;
         }
-
-        // Process complete lines (NDJSON)
-        const lines = socket.data.buffer.split('\n');
-        socket.data.buffer = lines.pop() || ""; // Keep incomplete line
 
         for (const line of lines) {
           await handleRequestLine(socket, line);
@@ -1499,8 +1571,8 @@ function startServer(): void {
       },
 
       error(socket, error) {
-        const bufferInfo = socket.data?.buffer
-          ? ` (partial: ${socket.data.buffer.slice(0, SOCKET_ERROR_PARTIAL_LIMIT)}...)`
+        const bufferInfo = socket.data?.framer.getBuffer()
+          ? ` (partial: ${socket.data.framer.getBuffer().slice(0, SOCKET_ERROR_PARTIAL_LIMIT)}...)`
           : '';
         console.error(`Socket error${bufferInfo}:`, error);
         if (socket.data && !socket.data.cleaned) {
